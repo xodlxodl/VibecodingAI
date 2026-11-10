@@ -344,6 +344,13 @@ with tab_phone:
     m2.metric("기준선 범위", f"{max(0, res['lo']):.3f}~{res['hi']:.3f}")
     m3.metric("헛경보", f"{len(res['alarms'])}건", f"시간당 {res['rate']:.1f}건", delta_color="off")
     st.caption("확인용 녹화도 정상 출력이라 경보는 모두 헛경보예요. 기준선은 프린터마다 따로 만들어요.")
+    if res["alarms"]:
+        in_alarm = [test_w[i][1] for s, e in res["alarms"] for i in range(s, e + 1)]
+        st.caption(
+            f"헛경보 구간의 진동 중앙값은 {med(in_alarm):.2f}로, 기준선 중앙값 {res['m']:.2f}의 {med(in_alarm) / res['m']:.1f}배예요. "
+            f"기준선 녹화({len(base_w) * 10 / 60:.0f}분)에 없던 출력 단계(진동이 큰 구간)가 확인용 녹화에 있으면 정상이어도 경보가 울려요. "
+            "K를 올려 헛경보를 없애면 진짜 이상도 놓치기 쉬워서, 기준선 녹화에 출력의 모든 단계를 담거나 단계별로 기준선을 따로 잡는 게 먼저예요."
+        )
 
 with tab_bear:
     st.subheader("손 재현: 결함 주파수")
