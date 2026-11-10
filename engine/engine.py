@@ -1,4 +1,7 @@
-"""VibeData AI 공용 이상 탐지 엔진 (Python)
+"""VibeData AI 공용 이상 탐지 엔진 (Python) · v1.1 (2026-11-10)
+
+v1.1 변경: 시간 열이 없는 표(보험 계약·건강검진 등)는 '표 모드'로 분석(이벤트로 묶지 않고 이상치 행만),
+          값이 2~5가지뿐인 숫자 열(성별 1/2, 여부 0/1 등)은 범주로 보고 자동 선택에서 제외.
 
 데모 사이트의 engine.js를 Python으로 옮긴 것입니다. 함수 이름과 결과 구조는 원본과 같게 두었습니다.
 화면(Streamlit) 코드는 없고, 계산만 합니다. 각 팀원 페이지에서 불러서 씁니다.
@@ -365,6 +368,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 KNAME_RE = re.compile(r"^[가-힣]{2,4}$")
 LABEL_HINT = re.compile(r"정답|label|이상여부|is_?anomaly|target|ground.?truth", re.I)
 COUNTER_HINT = re.compile(r"(^|_)id$|번호|순번|레이어|layer|index|^no$", re.I)
+COUNT_HINT = re.compile(r"건수|횟수|개수|자녀|사고|청구|nb$|cnt|count|num_|^n_", re.I)
 _NUM_RE = re.compile(r"^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$")
 
 
@@ -421,6 +425,7 @@ def profile(table: dict) -> dict:
             vals = [v for v in nums if is_num(v)]
             uniq_nums = set(vals)
             all_int = all(abs(v - round(v)) < 1e-9 for v in vals)
+            c["allInt"] = all_int
             nondecr = all(vals[i] >= vals[i - 1] for i in range(1, len(vals)))
             if LABEL_HINT.search(name) and all(v in (0, 1) for v in uniq_nums):
                 c["role"] = "label"
@@ -428,6 +433,15 @@ def profile(table: dict) -> dict:
                 c["role"] = "counter"
             elif len(uniq_nums) <= 1:
                 c["role"] = "constant"
+            elif all_int and len(uniq_nums) <= 5:
+                # 성별(1/2), 여부(0/1), 등급(1~5)처럼 값이 몇 가지뿐인 정수 열은 '숫자로 적은 범주'로 봄 (v1.1)
+                c["role"], c["coded"], c["top"] = "category", True, _top_values(strs)
+                # 단, 0부터 이어지고 큰 값일수록 드문 열(사고 건수 0~4, 자녀 수 등)은 범주가 아니라 '횟수'로 표시 (분석 자동 선택에서는 똑같이 뺌)
+                levels = sorted(uniq_nums)
+                freq = [sum(1 for v in vals if v == u) for u in levels]
+                if len(levels) >= 3 and levels[0] == 0 and levels == list(range(int(levels[-1]) + 1)) and (
+                        COUNT_HINT.search(name) or all(freq[i] > freq[i + 1] for i in range(len(freq) - 1))):
+                    c["countlike"] = True
             else:
                 c["role"] = "numeric"
             c["stats"] = {"min": min(vals), "max": max(vals), "mean": mean(vals), "median": median(vals), "std": std(vals),
@@ -483,9 +497,29 @@ def guess_pack(prof) -> str:
     return "general"
 
 
-def recommend_columns(prof):
-    """분석할 숫자 열 추천 (변하는 숫자 열 최대 6개)"""
-    return [c["name"] for c in prof["cols"] if c["role"] == "numeric" and c["stats"] and c["stats"]["std"] > 0][:6]
+ID_HINT = re.compile(r"id|번호|코드|code|key", re.I)
+
+
+def _mark_id_columns(prof, n_rows):
+    """표 모드: 행 순서가 섞여 있어도 계약번호·환자번호 같은 ID 열을 분석에서 빼기 위해,
+    정수이고 값이 모두 다르며 (이름에 id·번호가 있거나 값이 거의 연속인) 열은 '번호·순번'으로 바꿈"""
+    for c in prof["cols"]:
+        st = c.get("stats")
+        if c["role"] != "numeric" or not st:
+            continue
+        filled = n_rows - c["missing"]
+        if filled < 20 or c["unique"] != filled:
+            continue
+        if not c.get("allInt"):
+            continue
+        span = st["max"] - st["min"] + 1
+        if ID_HINT.search(c["name"]) or span <= 1.5 * filled:
+            c["role"], c["idLike"] = "counter", True
+
+
+def recommend_columns(prof, limit=6):
+    """분석할 숫자 열 추천 (변하는 숫자 열, 시계열 최대 6개 · 표 최대 12개)"""
+    return [c["name"] for c in prof["cols"] if c["role"] == "numeric" and c["stats"] and c["stats"]["std"] > 0][:limit]
 
 
 def pack_rules(pack_id, prof):
@@ -510,11 +544,11 @@ METHODS = [
 ]
 
 
-def prepare(table, prof, selected):
-    """중복 행을 빼고 시간순으로 정렬한 뒤, 고른 열을 숫자로 바꿈"""
+def prepare(table, prof, selected, drop_duplicates=True):
+    """중복 행을 빼고(선택) 시간순으로 정렬한 뒤, 고른 열을 숫자로 바꿈"""
     time_col = next((c for c in prof["cols"] if c["role"] == "time"), None)
     label_col = next((c for c in prof["cols"] if c["role"] == "label"), None)
-    dup = set(prof["dupRows"])
+    dup = set(prof["dupRows"]) if drop_duplicates else set()
     rows = table["rows"]
     idx = [i for i in range(len(rows)) if i not in dup]
     times = None
@@ -1018,24 +1052,225 @@ def template_report(S: dict) -> str:
     return "\n".join(L)
 
 
+# ---------------------------------------------------------------- 표 모드 (v1.1): 행 순서가 의미 없는 데이터
+# 보험 계약, 건강검진처럼 한 행이 한 사람(한 건)이고 시간 순서가 없는 표에서는
+# 이동 중앙값·관리도·변동성·이벤트 묶기가 의미가 없습니다(행 순서가 바뀌면 결과가 바뀜).
+# 그래서 시간 열이 없으면 '표 모드'로 돌아서, 행마다 따로
+#   ① 열별 robust Z: 전체 데이터의 중앙값에서 얼마나 떨어졌나 (|Z| ≥ 4×k)
+#      오른쪽으로 길게 늘어진 열(금액·혈당 등, 왜도 > 1)은 로그로 바꿔서 봄
+#   ② 다변량: 여러 열의 조합이 전체 분포에서 얼마나 드문가 (Mahalanobis, χ² 99.9%의 1.5배 이상)
+#   ③ 기준 규칙: 예) 공복혈당 126 이상
+# 을 보고 '이상치 행'을 고릅니다. 이벤트로 묶지 않습니다.
+
+def _skew(a):
+    """표본 왜도 (오른쪽으로 길면 +)"""
+    n = len(a)
+    if n < 3:
+        return 0.0
+    m = sum(a) / n
+    s2 = sum((v - m) ** 2 for v in a) / n
+    if s2 <= 0:
+        return 0.0
+    return sum((v - m) ** 3 for v in a) / n / s2 ** 1.5
+
+
+def analyze_table(prep, rules, k=1.0):
+    n, cols = len(prep["idx"]), prep["cols"]
+    zthr = 4 * k
+    for c in cols:
+        fin = [v for v in c["values"] if is_num(v)]
+        # 금액·혈당·간수치처럼 오른쪽으로 길게 늘어진(0 이상, 왜도 > 1) 열은 로그로 바꿔서 봄.
+        # 그대로 보면 정상인 큰 값까지 수백 개씩 이상치로 잡힘 (예: 보험금 5% → 로그 후 0.8%)
+        shift, use_log = 0.0, False
+        if len(fin) >= 20 and min(fin) >= 0 and _skew(fin) > 1:
+            shift = 0.0 if min(fin) > 0 else 1.0
+            if abs(_skew([math.log(v + shift) for v in fin])) < abs(_skew(fin)):
+                use_log = True
+        tf = (lambda v: math.log(v + shift)) if use_log else (lambda v: v)
+        tvals = [tf(v) if is_num(v) else NaN for v in c["values"]]
+        rb = robust(tvals)
+        c["scale"] = "log" if use_log else "raw"
+        c["mu"] = math.exp(rb["m"]) - shift if use_log else rb["m"]       # 중앙값(원래 단위)
+        c["sigma"] = rb["s"]
+        lo, hi = rb["m"] - zthr * rb["s"], rb["m"] + zthr * rb["s"]
+        if use_log:
+            lo, hi = math.exp(lo) - shift, math.exp(hi) - shift
+        if fin and min(fin) >= 0:
+            lo = max(lo, 0.0)                                              # 음수가 될 수 없는 값은 정상범위도 0부터
+        c["band"] = [lo, hi]
+        c["z"] = [(t - rb["m"]) / rb["s"] if is_num(t) else NaN for t in tvals]
+        c["missingIdx"] = [i for i, v in enumerate(c["values"]) if not is_num(v)]
+        # 절반 넘게 같은 값인 열(사고 건수 0이 대부분, 0/1 여부 등)은 퍼짐(MAD)이 0이라 Z가 의미 없음.
+        # 이런 열은 통계적 이상치는 보지 않고, 기준 규칙(rules)만 적용함
+        med_raw = median(fin) if fin else NaN
+        c["discrete"] = bool(fin) and sum(1 for v in fin if v == med_raw) > 0.5 * len(fin)
+        if c["discrete"]:
+            c["z"] = [NaN] * n
+            c["band"] = [min(fin), max(fin)]
+    use = [j for j, c in enumerate(cols) if not c["discrete"]]
+    p = len(cols)
+    mv = [0.0] * n
+    contrib = [[0.0] * p for _ in range(n)]
+    if len(use) >= 2:
+        Z = np.array([[cols[j]["z"][i] for j in use] for i in range(n)], dtype=float)
+        complete = ~np.isnan(Z).any(axis=1)
+        trim = complete & (np.abs(np.nan_to_num(Z)) < 3).all(axis=1)   # 확실히 평범한 행으로 기준 분포를 잡음
+        if trim.sum() > len(use) + 5:
+            B = Z[trim]
+            center = np.median(B, axis=0)
+            D = B - center
+            S = D.T @ D / (len(B) - 1)
+            S = np.where(np.eye(len(use), dtype=bool), S, 0.9 * S)
+            try:
+                if np.linalg.cond(S) > 1e12:
+                    raise np.linalg.LinAlgError
+                Si = np.linalg.inv(S)
+                thr = chi2q(len(use), 3.09)
+                Dz = np.where(complete[:, None], Z - center, 0.0)
+                Sd = Dz @ Si.T
+                D2 = np.sum(Dz * Sd, axis=1)
+                parts = np.maximum(0, Dz * Sd)
+                tot = parts.sum(axis=1)
+                tot[tot == 0] = 1
+                mv = [float(np.sqrt(max(0.0, d) / thr)) if ok else 0.0 for d, ok in zip(D2, complete)]
+                share = parts / tot[:, None]
+                for i in range(n):
+                    for a, j in enumerate(use):
+                        contrib[i][j] = float(share[i, a])
+            except np.linalg.LinAlgError:
+                pass
+    rule_hits = eval_rules(prep, rules)
+    rows, outliers = [], []
+    for i in range(n):
+        zs = [c["z"][i] for c in cols]
+        hit_cols = [j for j, z in enumerate(zs) if is_num(z) and abs(z) >= zthr]
+        maxz = max([abs(z) for z in zs if is_num(z)] or [0.0])
+        mv_hit = mv[i] >= 1.5 * k   # 표 데이터는 꼬리가 두꺼워서 조합 이상은 더 강할 때만 인정
+        cause = list(hit_cols)
+        if mv_hit:
+            for j, sh in enumerate(contrib[i]):
+                if sh >= 0.3 and j not in cause:
+                    cause.append(j)
+        rule = len(rule_hits[i]) > 0
+        for rid in rule_hits[i]:
+            r = next((x for x in rules if x["id"] == rid), None)
+            j = next((jj for jj, c in enumerate(cols) if r and c["name"] == r["col"]), -1)
+            if j >= 0 and j not in cause:
+                cause.append(j)
+        flagged = bool(hit_cols) or mv_hit or rule
+        top = max(maxz / 4, mv[i])
+        sev = ""
+        if flagged:
+            sev = "critical" if rule else ("serious" if maxz >= 1.5 * zthr or mv[i] >= 2.5 * k or len(hit_cols) >= 2 else "warning")
+        score = min(99, js_round(100 * (1 - math.exp(-0.8 * top))))
+        row = {"i": i, "z": zs, "maxz": maxz, "mv": mv[i], "flagged": flagged, "sev": sev, "score": score, "cause": cause,
+               "ruleIds": rule_hits[i], "rule": rule, "mvOnly": mv_hit and not hit_cols and not rule}
+        rows.append(row)
+        if flagged:
+            outliers.append(row)
+    outliers.sort(key=lambda r: (-_SEV_RANK[r["sev"]], -r["score"], r["i"]))
+    return {"rows": rows, "outliers": outliers, "events": [], "k": k}
+
+
+def evaluate_table(prep, res):
+    if not prep["labels"]:
+        return None
+    L = prep["labels"]
+    ens = dict(key="ens", name="VibeData 표 모드", tech="열별 robust Z + 다변량 + 규칙", **_score([r["flagged"] for r in res["rows"]], L))
+    return {"methods": [], "ruleOnly": dict(key="rule", name="기준 규칙만", tech="고정 기준치", **_score([r["rule"] for r in res["rows"]], L)),
+            "ens": ens, "positives": sum(L), "n": len(L)}
+
+
+def build_summary_table(prep, res, rules, pack, dataset_name="", excluded=None, n_raw=None):
+    """표 모드 요약 (AI에게 보낼 것). 개인별 행 번호·값은 넣지 않고 열별 집계만"""
+    sev_ko = {"critical": "위험", "serious": "경고", "warning": "주의"}
+    n = len(prep["idx"])
+    counts = {"critical": 0, "serious": 0, "warning": 0}
+    for r in res["outliers"]:
+        counts[r["sev"]] += 1
+    zthr = 4 * res["k"]
+    var = []
+    for j, c in enumerate(prep["cols"]):
+        zs = [abs(z) for z in c["z"] if is_num(z)]
+        hi = sum(1 for z in c["z"] if is_num(z) and z >= zthr)
+        lo = sum(1 for z in c["z"] if is_num(z) and z <= -zthr)
+        var.append({"이름": c["display"], "의미": c["meaning"] or None, "단위": c["unit"] or None, "척도": "값 종류 적음(기준 규칙만 적용)" if c.get("discrete") else ("로그" if c.get("scale") == "log" else "원래 값"),
+                    "중앙값": round_to(c["mu"], 2),
+                    "정상범위": [round_to(c["band"][0], 2), round_to(c["band"][1], 2)], "결측": len(c["missingIdx"]),
+                    "이상치_높은쪽": hi, "이상치_낮은쪽": lo, "가장_큰_이탈_Z": round_to(max(zs), 1) if zs else None})
+    rule_cnt = []
+    for r in rules:
+        if r.get("on") is False:
+            continue
+        rule_cnt.append({"규칙": r["label"], "출처": r.get("source", ""), "해당_행수": sum(1 for row in res["rows"] if r["id"] in row["ruleIds"]),
+                         "비율_퍼센트": round_to(100 * sum(1 for row in res["rows"] if r["id"] in row["ruleIds"]) / max(1, n), 1)})
+    return {
+        "데이터": {"이름": dataset_name, "분석_행수": n, "제외한_열": excluded or []},
+        "분석_방식": "표",
+        "도메인": pack["name"],
+        "분석_방법": [f"열별 robust Z (|Z|≥{round_to(zthr, 1)}, 왜도 큰 열은 로그 척도)", "다변량 Mahalanobis (χ² 99.9% 기준의 1.5배)", "기준 규칙"],
+        "변수": var,
+        "기준_규칙": rule_cnt,
+        "이상치_행수": {"전체": len(res["outliers"]), "위험": counts["critical"], "경고": counts["serious"], "주의": counts["warning"],
+                    "조합만_특이": sum(1 for r in res["outliers"] if r["mvOnly"])},
+    }
+
+
+def template_report_table(S: dict) -> str:
+    c = S["이상치_행수"]
+    L = ["## 요약", f"- {S['데이터']['분석_행수']}행을 분석해 확인이 필요한 행 {c['전체']}개(위험 {c['위험']}, 경고 {c['경고']}, 주의 {c['주의']})를 찾았어요. 기준 규칙에 해당하거나 값이 통계적으로 극단적인 행이에요."]
+    for r in S["기준_규칙"]:
+        L.append(f"- \"{r['규칙']}\"에 해당하는 행은 {r['해당_행수']}개({r['비율_퍼센트']}%)예요.")
+    L += ["", "## 열별 이상치"]
+    for v in S["변수"]:
+        if v["이상치_높은쪽"] or v["이상치_낮은쪽"]:
+            L.append(f"- **{v['이름']}**: 높은 쪽 {v['이상치_높은쪽']}개, 낮은 쪽 {v['이상치_낮은쪽']}개 (중앙값 {v['중앙값']}, 정상범위 {v['정상범위'][0]}~{v['정상범위'][1]}).")
+    if c["조합만_특이"]:
+        L.append(f"- 값 하나하나는 범위 안인데 조합이 드문 행이 {c['조합만_특이']}개 있어요.")
+    disc = [v["이름"] for v in S["변수"] if v.get("척도", "").startswith("값 종류")]
+    if disc:
+        L.append(f"- {', '.join(disc)}: 절반 넘게 같은 값이라 통계적 이상치는 보지 않고 기준 규칙만 적용했어요. 분포표로 확인하세요.")
+    L += ["", "## 한계", "- 이상치는 입력 오류일 수도, 실제로 드문 사람(건)일 수도 있어요. 원자료와 함께 확인해야 해요."]
+    return "\n".join(L)
+
+
 # ---------------------------------------------------------------- 한 번에 실행 (페이지에서 쓰기 쉽게)
-def run_engine(table, columns=None, pack=None, k=1.0, rules=None, mult=None, dismissed=None, dataset_name=""):
-    """CSV 표 하나를 넣으면 점검 → 준비 → 4가지 점수 → 판정·이벤트 → 추세 → (정답 열 있으면) 성능까지 한 번에.
+def run_engine(table, columns=None, pack=None, k=1.0, rules=None, mult=None, dismissed=None, dataset_name="", mode="auto"):
+    """CSV 표 하나를 넣으면 점검부터 판정까지 한 번에.
 
     table   : load_csv()의 결과 또는 pandas DataFrame
-    columns : 분석할 열 이름 목록 (없으면 자동 추천)
-    pack    : 'phm' / 'food' / 'general' (없으면 열 이름으로 추정). 팀 페이지는 보통 'general' + 자기 규칙(rules)
-    rules   : [{"id": "r1", "col": "열 이름", "op": ">", "value": 5, "durationMin": 0, "label": "설명", "source": "출처"}]
+    columns : 분석할 열 이름 목록 (없으면 자동 추천: 값이 변하는 숫자 열, 시계열 최대 6개·표 최대 12개, 값이 5가지 이하인 정수 열은 제외)
+    mode    : 'auto'(기본) — 시간 열이 있으면 '시계열', 없으면 '표'
+              'timeseries' — 행이 시간 순서인 데이터(센서, 사이클 번호 등). 시간 열이 없어도 순서가 의미 있으면 이걸 지정
+              'table' — 한 행이 한 사람·한 건인 데이터(보험 계약, 건강검진). 이벤트로 묶지 않고 이상치 행만 찾음
+    pack    : 'phm' / 'food' / 'general' (없으면 열 이름으로 추정)
+    rules   : [{"id": "r1", "col": "열 이름", "op": ">=", "value": 126, "durationMin": 0, "label": "설명", "source": "출처"}]
     """
     if hasattr(table, "columns") and hasattr(table, "itertuples"):
         table = table_from_dataframe(table)
     prof = profile(table)
-    selected = columns or recommend_columns(prof)
+    if mode == "auto":
+        mode = "timeseries" if prof["time"] else "table"
+    if mode not in ("timeseries", "table"):
+        raise ValueError("mode는 'auto', 'timeseries', 'table' 중 하나예요.")
+    if mode == "table":
+        _mark_id_columns(prof, len(table["rows"]))
+    selected = columns or recommend_columns(prof, limit=12 if mode == "table" else 6)
     if not selected:
-        raise ValueError("분석할 숫자 열이 없어요. 값이 변하는 숫자 열이 하나 이상 있어야 해요.")
+        raise ValueError("분석할 숫자 열이 없어요. 값이 변하는 숫자 열이 하나 이상 있어야 해요(값이 5가지 이하인 정수 열은 범주로 봐요).")
     pack_id = pack or guess_pack(prof)
     if rules is None:
         rules = pack_rules(pack_id, prof)
+    excluded = [c["name"] for c in prof["cols"] if c["role"] == "personal"]
+    common = {"profile": prof, "rules": rules, "pack": pack_id, "mode": mode, "columns": selected}
+    if mode == "table":
+        prep = prepare(table, prof, selected, drop_duplicates=False)   # 같은 값의 사람이 둘일 수 있어 중복을 빼지 않음
+        if len(prep["idx"]) < 10:
+            raise ValueError("행이 너무 적어요. 최소 10행 이상이 필요해요.")
+        res = analyze_table(prep, rules, k)
+        return dict(common, prep=prep, base={"n": len(prep["idx"])}, result=res, forecasts=[], evaluation=evaluate_table(prep, res),
+                    summary=build_summary_table(prep, res, rules, PACKS[pack_id], dataset_name, excluded),
+                    notice="표 모드: 시간 순서가 없는 데이터라 행마다 이상치를 찾았어요(이벤트로 묶지 않음).")
     prep = prepare(table, prof, selected)
     if len(prep["idx"]) < 10:
         raise ValueError("행이 너무 적어요. 최소 10행 이상이 필요해요.")
@@ -1043,16 +1278,33 @@ def run_engine(table, columns=None, pack=None, k=1.0, rules=None, mult=None, dis
     res = classify(prep, base, rules, k, mult=mult, dismissed=dismissed)
     fc = forecasts(prep, base, rules)
     ev = evaluate(prep, base, rules, k, mult=mult, dismissed=dismissed)
-    excluded = [c["name"] for c in prof["cols"] if c["role"] == "personal"]
     summary = build_summary(prep, base, res, fc, rules, PACKS[pack_id], dataset_name, excluded)
-    return {"profile": prof, "prep": prep, "base": base, "result": res, "forecasts": fc, "evaluation": ev,
-            "rules": rules, "pack": pack_id, "summary": summary}
+    return dict(common, prep=prep, base=base, result=res, forecasts=fc, evaluation=ev, summary=summary,
+                notice="시계열 모드: 행 순서(시간)를 따라 4가지 방법으로 보고 이어진 이상을 이벤트로 묶었어요.")
+
+
+def report_text(out) -> str:
+    """AI 없이 만드는 기본 리포트 (모드에 맞게)"""
+    return template_report_table(out["summary"]) if out["mode"] == "table" else template_report(out["summary"])
 
 
 def events_table(out) -> list:
-    """이벤트 목록을 표(st.dataframe에 바로 넣을 수 있는 dict 목록)로"""
+    """결과를 표(st.dataframe에 바로 넣을 수 있는 dict 목록)로.
+    시계열 모드: 이벤트 목록 / 표 모드: 이상치 행 목록"""
     sev_ko = {"critical": "위험", "serious": "경고", "warning": "주의"}
     prep = out["prep"]
+    if out.get("mode") == "table":
+        rows = []
+        for r in out["result"]["outliers"]:
+            i, cols = r["i"], prep["cols"]
+            names = [cols[j]["display"] for j in r["cause"]]
+            vals = [f"{cols[j]['display']} {round_to(cols[j]['values'][i], 2)} (Z {round_to(cols[j]['z'][i], 1)})"
+                    for j in r["cause"] if is_num(cols[j]["values"][i])]
+            rules = [x["label"] for x in out["rules"] if x["id"] in r["ruleIds"]]
+            rows.append({"원래 행": prep["rowNums"][i], "등급": sev_ko[r["sev"]], "이상 열": ", ".join(names),
+                         "값 (robust Z)": " / ".join(vals), "조합 점수": round_to(r["mv"], 2), "이상 점수": r["score"],
+                         "규칙 위반": ", ".join(rules), "유형": "조합이 드묾" if r["mvOnly"] else ("기준 위반" if r["rule"] and not names else "값이 극단적")})
+        return rows
     with_sec = is_num(prep["intervalMs"]) and prep["intervalMs"] < 60000
 
     def t(i):
@@ -1068,11 +1320,38 @@ def events_table(out) -> list:
     return rows
 
 
-def scores_table(out) -> list:
-    """행마다 4가지 점수와 판정 (그래프 그릴 때 사용)"""
-    prep, res = out["prep"], out["result"]
-    with_sec = is_num(prep["intervalMs"]) and prep["intervalMs"] < 60000
+def check_table(out) -> list:
+    """데이터 점검 결과(열 역할·결측·개인정보) 표. 모든 페이지에서 쓸 수 있음"""
+    role_ko = {"numeric": "숫자", "time": "시간", "personal": "개인정보(분석 제외)", "label": "정답 라벨", "counter": "번호·순번",
+               "constant": "값이 하나뿐", "category": "범주", "text": "글자"}
     rows = []
+    for c in out["profile"]["cols"]:
+        role = role_ko.get(c["role"], c["role"])
+        if c.get("countlike"):
+            role = "횟수(값 종류 적음 · 자동 분석 제외)"
+        elif c.get("coded"):
+            role = "범주(숫자로 적힘)"
+        if c["role"] == "personal":
+            role += f" · {c['kind']}"
+        rows.append({"열": c["name"], "역할": role, "분석에 사용": c["name"] in out["columns"], "결측": c["missing"], "서로 다른 값": c["unique"]})
+    return rows
+
+
+def scores_table(out) -> list:
+    """행마다 점수와 판정 (그래프 그릴 때 사용)"""
+    prep, res = out["prep"], out["result"]
+    rows = []
+    if out.get("mode") == "table":
+        for r in res["rows"]:
+            i = r["i"]
+            row = {"원래 행": prep["rowNums"][i]}
+            for j, c in enumerate(prep["cols"]):
+                row[c["display"]] = c["values"][i] if is_num(c["values"][i]) else None
+                row[c["display"] + " Z"] = round_to(r["z"][j], 2) if is_num(r["z"][j]) else None
+            row.update({"조합 점수": round_to(r["mv"], 3), "이상": r["flagged"], "등급": r["sev"]})
+            rows.append(row)
+        return rows
+    with_sec = is_num(prep["intervalMs"]) and prep["intervalMs"] < 60000
     for r in res["rows"]:
         i = r["i"]
         row = {"순서": i, "원래 행": prep["rowNums"][i], "시각": fmt_time(prep["times"][i], with_sec) if prep["times"] else ""}
