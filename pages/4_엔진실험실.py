@@ -1,10 +1,12 @@
 """엔진 실험실 (담당: 수학과 B)
 이상 심어 보기 · 240회 실험 결과 · 기준값 k · 숫자 검증기 · robust Z 손 재현.
 240회 실험과 k 곡선, 검증기 시험 결과는 HTML 시안에 저장된 값(data/snap.json)을 그대로 보여 줘요.
-'이상 심어 보기'는 robust Z 하나만 쓰는 단순한 탐지기라 HTML의 4개 방법 합의 엔진과 달라요.
+'이상 심어 보기'는 단순 robust Z 탐지기와 공용 엔진(시계열 모드, 4개 방법 합의)을 골라 돌려 볼 수 있어요.
+공용 엔진 v1.1부터 시간 열이 없으면 자동으로 표 모드가 되므로, 행 순서가 시간인 데이터는 mode="timeseries"를 꼭 지정해요.
 """
 import json
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -12,8 +14,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="엔진 실험실", layout="wide")
 ROOT = Path(__file__).parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from engine import check_table, events_table, load_csv, report_text, run_engine  # noqa: E402
+
+st.set_page_config(page_title="엔진 실험실", layout="wide")
 NUM_RE = re.compile(r"(?:^|[^A-Za-z0-9_.])(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)")
 
 
@@ -54,6 +60,14 @@ def segments(mask, min_len):
     return out
 
 
+def engine_segments(y, k):
+    """공용 엔진을 시계열 모드로 돌려 (시작 행, 끝 행) 목록을 돌려줘요.
+    시간 열이 없는 데이터라 mode를 지정하지 않으면 표 모드가 되어 이벤트가 0건이 돼요."""
+    out = run_engine(pd.DataFrame({"값": y}), mode="timeseries", k=k)
+    rn = out["prep"]["rowNums"]  # CSV 줄 번호(머리글이 1번) → 0부터 세는 행 번호는 -2
+    return out, [(rn[e["start"]] - 2, rn[e["end"]] - 2) for e in out["result"]["events"]]
+
+
 st.caption("엔진 실험실 · 담당: 수학과 B")
 st.title("이 엔진을 어디까지 믿을 수 있나")
 big = L["bench"]["big"]
@@ -63,15 +77,21 @@ b.metric("정밀도", f"{L['bench']['precision']:.1%}")
 c.metric("4σ 이상 F1", f"{big['f1']:.2f}")
 d.metric("숫자 검증기 재현율", f"{L['verifier']['numRecall']:.1%}")
 
-t_inject, t_bench, t_k, t_ver, t_rob, t_ai = st.tabs(["이상 심어 보기", "240회 실험", "기준값 k", "숫자 검증기", "robust Z 손 재현", "AI 전송 설계"])
+t_inject, t_csv, t_bench, t_k, t_ver, t_rob, t_ai = st.tabs(
+    ["이상 심어 보기", "내 CSV로 돌려 보기", "240회 실험", "기준값 k", "숫자 검증기", "robust Z 손 재현", "AI 전송 설계"])
 
 with t_inject:
     st.subheader("이상을 하나 심고 탐지기를 돌려요")
     st.caption("회색 = 심은 구간(정답), 빨강 = 잡은 이벤트 · 겹치면 정답, 안 겹치면 오탐")
+    detector = st.radio("탐지기", ["robust Z 하나 (단순)", "공용 엔진 (시계열 모드)"], horizontal=True)
+    use_engine = detector.startswith("공용")
     col1, col2, col3, col4 = st.columns(4)
     kind = col1.selectbox("이상 종류", ["튀는 값", "수준 이동", "변동성 증가", "서서히 흐름"])
     size = col2.slider("크기(σ)", 1.0, 8.0, 4.0, 0.5)
-    k_val = col3.slider("기준 |z|", 2.0, 8.0, 4.0, 0.5)
+    if use_engine:
+        k_val = col3.slider("민감도 k (크면 덜 민감)", 0.5, 3.0, 1.0, 0.1)
+    else:
+        k_val = col3.slider("기준 |z|", 2.0, 8.0, 4.0, 0.5)
     seed = col4.number_input("시드", 0, 9999, 42)
     r = np.random.default_rng(int(seed))
     n, start, length = 500, 320, 40
@@ -85,8 +105,12 @@ with t_inject:
         y[start: start + length] = 10 + (y[start: start + length] - 10) * size
     else:
         y[start: start + length] += np.linspace(0, size, length)
-    _, _, z = robust_z(y, 150)
-    events = segments(np.abs(z) >= k_val, 1 if kind == "튀는 값" else 2)
+    if use_engine:
+        out, events = engine_segments(y, k_val)
+        st.caption(f"엔진 모드: {out['mode']} · 분석 열: {', '.join(out['columns'])} · {out['notice']}")
+    else:
+        _, _, z = robust_z(y, 150)
+        events = segments(np.abs(z) >= k_val, 1 if kind == "튀는 값" else 2)
     hit = any(s <= start + length - 1 and e >= start for s, e in events)
     fp = sum(1 for s, e in events if e < start or s > start + length - 1)
     fig = go.Figure(go.Scatter(y=y, name="값", line=dict(width=1)))
@@ -98,6 +122,42 @@ with t_inject:
     a, b = st.columns(2)
     a.metric("심은 이상", "잡음" if hit else "놓침")
     b.metric("오탐", f"{fp}건")
+    if use_engine:
+        with st.expander("모드를 지정하지 않으면? (auto → 표 모드)"):
+            auto = run_engine(pd.DataFrame({"값": y}), k=k_val)
+            st.write(f"자동 모드 결과: **{auto['mode']}** · 이벤트 {len(auto['result'].get('events', []))}건 · "
+                     f"확인이 필요한 행 {len(auto['result'].get('outliers', []))}개")
+            st.caption("이 데이터에는 시간 열이 없어서 자동이면 표 모드가 돼요. 행을 하나씩 따로 보므로 수준 이동·서서히 흐름 같은 '이어진 이상'을 이벤트로 묶지 못해요.")
+
+with t_csv:
+    st.subheader("내 CSV를 공용 엔진에 넣어 보기")
+    st.caption("시간 열이 있으면 자동으로 시계열, 없으면 표 모드예요. 시간 열 없이 행 순서가 시간인 센서 데이터라면 '시계열'을 고르세요.")
+    file = st.file_uploader("CSV 파일", type=["csv"])
+    col1, col2 = st.columns(2)
+    mode_ko = {"자동": "auto", "시계열 (행 순서 = 시간)": "timeseries", "표 (한 행 = 한 건)": "table"}
+    mode_label = col1.radio("모드", list(mode_ko), horizontal=True)
+    k_csv = col2.slider("민감도 k (크면 덜 민감)", 0.5, 3.0, 1.0, 0.1, key="k_csv")
+    if file is not None:
+        try:
+            table = load_csv(file.getvalue())
+            out = run_engine(table, mode=mode_ko[mode_label], k=k_csv, dataset_name=file.name)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            a, b, c = st.columns(3)
+            a.metric("실제로 돈 모드", "시계열" if out["mode"] == "timeseries" else "표")
+            b.metric("분석한 열", len(out["columns"]))
+            c.metric("이벤트" if out["mode"] == "timeseries" else "확인이 필요한 행",
+                     len(out["result"]["events"] if out["mode"] == "timeseries" else out["result"]["outliers"]))
+            st.caption(out["notice"])
+            if mode_ko[mode_label] == "auto" and out["mode"] == "table":
+                st.info("시간 열을 찾지 못해 표 모드로 돌았어요. 센서처럼 행 순서가 시간인 데이터라면 위에서 '시계열'을 고르세요.")
+            st.markdown("**데이터 점검**")
+            st.dataframe(pd.DataFrame(check_table(out)), width="stretch", hide_index=True)
+            st.markdown("**이벤트**" if out["mode"] == "timeseries" else "**확인이 필요한 행**")
+            st.dataframe(pd.DataFrame(events_table(out)), width="stretch", hide_index=True)
+            with st.expander("기본 리포트"):
+                st.markdown(report_text(out))
 
 with t_bench:
     st.subheader("이상 종류 × 크기별 재현율")
