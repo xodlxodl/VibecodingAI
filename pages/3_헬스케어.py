@@ -3,6 +3,9 @@
 예시 데이터는 건강검진정보 구조를 흉내 낸 시뮬레이션이에요. HTML과 난수 생성기가 달라 숫자는 조금 달라요.
 진단이 아니라 선별 도구이며, 기준은 학회 원문으로 확인한 뒤 출처와 연도를 적어야 해요.
 """
+import io
+import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -103,7 +106,7 @@ def add_mets(df):
 
 @st.cache_data
 def diabetes_model(df):
-    d = df[df[["tg", "hdl"]].notna().all(axis=1)].copy()
+    d = df.dropna(subset=["sex", "fbg", "age", "bmi", "waist", "sbp", "dbp", "tg", "hdl", "ggt", "smoke", "drink"]).copy()
     d["male"] = (d["sex"] == 1).astype(int)
     d["smoker"] = (d["smoke"] == 3).astype(int)
     y = (d["fbg"] >= 126).astype(int)
@@ -119,28 +122,167 @@ def mask(k, n):
     return "가림" if 0 < n < 5 or 0 < k < 5 else f"{k / n:.1%}" if n else "-"
 
 
+# ---------------------------------------------------------------- CSV 열 맞추기
+# 페이지에서 쓰는 이름 → 화면에 보일 이름
+FIELDS = {
+    "sex": "성별", "age": "나이 (또는 연령대 코드)", "height": "키 (BMI 계산용)", "weight": "몸무게 (BMI 계산용)",
+    "bmi": "BMI", "waist": "허리둘레", "sbp": "수축기 혈압", "dbp": "이완기 혈압", "fbg": "공복혈당",
+    "tc": "총콜레스테롤", "tg": "중성지방", "hdl": "HDL 콜레스테롤", "ggt": "감마GTP",
+    "smoke": "흡연 상태 (3=현재 흡연)", "drink": "음주 여부",
+}
+# 별명 사전: 대소문자·띄어쓰기·밑줄·괄호를 지운 뒤 비교해요.
+# 예) "SMK_stat_type_cd" → "smkstattypecd", "식전혈당(공복혈당)" → "식전혈당공복혈당"
+ALIASES = {
+    "sex": ["sex", "gender", "성별", "성별코드", "성별코드1남2여"],
+    "age": ["age", "나이", "연령", "agegroup", "agegrp", "연령대", "연령대코드", "연령대코드5세단위"],
+    "height": ["height", "ht", "키", "신장", "신장5cm단위"],
+    "weight": ["weight", "wt", "몸무게", "체중", "체중5kg단위"],
+    "bmi": ["bmi", "체질량지수"],
+    "waist": ["waist", "waistline", "waistcircumference", "허리", "허리둘레"],
+    "sbp": ["sbp", "bphigh", "systolic", "systolicbp", "수축기혈압", "최고혈압"],
+    "dbp": ["dbp", "bplwst", "bplow", "diastolic", "diastolicbp", "이완기혈압", "최저혈압"],
+    "fbg": ["fbg", "blds", "glucose", "fastingbloodsugar", "fastingglucose", "공복혈당", "식전혈당", "식전혈당공복혈당"],
+    "tc": ["tc", "totchole", "totalcholesterol", "cholesterol", "총콜레스테롤", "콜레스테롤총"],
+    "tg": ["tg", "triglyceride", "triglycerides", "트리글리세라이드", "트리글리세리드", "중성지방"],
+    "hdl": ["hdl", "hdlchole", "hdlcholesterol", "hdl콜레스테롤", "콜레스테롤hdl"],
+    "ggt": ["ggt", "gtp", "gammagtp", "ggtp", "감마지티피", "감마gtp", "γgtp", "감마지티피γgtp"],
+    "smoke": ["smoke", "smoking", "smkstat", "smkstattypecd", "흡연", "흡연상태"],
+    "drink": ["drink", "drinking", "drkyn", "음주", "음주여부"],
+}
+NONE = "(없음)"
+CORE = ["sex", "age", "bmi", "waist", "sbp", "dbp", "fbg"]  # 이 값이 빈 사람은 분석에서 빼요
+# 말이 안 되는 값은 빈칸으로 바꿔요 (예: 허리둘레 999 = 측정 안 함 표시)
+VALID = {"age": (1, 120), "bmi": (10, 70), "waist": (40, 200), "sbp": (60, 260), "dbp": (30, 180),
+         "fbg": (40, 600), "tc": (50, 600), "tg": (10, 5000), "hdl": (5, 200), "ggt": (1, 2000)}
+
+
+def norm(name):
+    return re.sub(r"[\s_\-\(\)\[\]\.·/]", "", str(name)).lower()
+
+
+@st.cache_data
+def read_any_csv(raw: bytes):
+    """한글 엑셀 CSV(cp949)와 UTF-8 모두 읽어요."""
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            t = pd.read_csv(io.BytesIO(raw), encoding=enc, low_memory=False)
+            if t.shape[1] == 1:  # 쉼표가 아닌 다른 구분자(탭·세미콜론)
+                t = pd.read_csv(io.BytesIO(raw), encoding=enc, sep=None, engine="python")
+            return t
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("글자 인코딩을 알 수 없어요. UTF-8이나 CP949로 저장해 주세요.")
+
+
+def guess_columns(columns):
+    """별명 사전으로 열을 자동으로 찾아요. 못 찾으면 None."""
+    by_norm = {norm(c): c for c in columns}
+    return {key: next((by_norm[a] for a in ALIASES[key] if a in by_norm), None) for key in FIELDS}
+
+
+def missing_fields(mapping):
+    miss = [k for k in FIELDS if k not in ("height", "weight", "bmi") and not mapping.get(k)]
+    if not mapping.get("bmi") and not (mapping.get("height") and mapping.get("weight")):
+        miss.append("bmi")
+    return miss
+
+
+def build_data(raw, mapping):
+    """고른 열을 페이지 형식(이름·값)으로 바꿔요. 바꾼 내용은 notes에 적어요."""
+    num = lambda k: pd.to_numeric(raw[mapping[k]], errors="coerce")
+    out, notes = pd.DataFrame(index=raw.index), []
+
+    # 성별: Male/Female, M/F, 남/여 → 1/2
+    s = raw[mapping["sex"]]
+    if pd.api.types.is_numeric_dtype(s):
+        out["sex"] = s
+    else:
+        t = s.astype(str).str.strip().str.lower()
+        out["sex"] = t.map({"male": 1, "m": 1, "남": 1, "남성": 1, "1": 1, "female": 2, "f": 2, "여": 2, "여성": 2, "2": 2})
+        notes.append("성별 글자(Male/Female 등)를 1·2로 바꿨어요.")
+
+    # 나이: 최댓값이 18 이하면 국민건강보험공단 연령대 코드(5=20~24세 … 18=85세 이상)로 보고 가운데 나이로 바꿔요
+    a = num("age")
+    if a.max() <= 18:
+        out["age"] = 20 + (a - 5) * 5 + 2
+        notes.append("나이 열이 연령대 코드(5세 단위)라서 구간의 가운데 나이로 바꿨어요. 예) 코드 14 → 67세")
+    else:
+        out["age"] = a
+
+    # BMI: 없으면 키·몸무게로 계산
+    if mapping.get("bmi"):
+        out["bmi"] = num("bmi")
+    else:
+        out["bmi"] = (num("weight") / (num("height") / 100) ** 2).round(1)
+        notes.append("BMI 열이 없어 몸무게 ÷ 키(m)²로 계산했어요. 키·몸무게가 5cm·5kg 단위로 묶인 데이터라 BMI도 대략값이에요.")
+
+    for k in ("waist", "sbp", "dbp", "fbg", "tc", "tg", "hdl", "ggt", "smoke"):
+        out[k] = num(k)
+
+    # 음주: Y/N → 1/0
+    dr = raw[mapping["drink"]]
+    if pd.api.types.is_numeric_dtype(dr):
+        out["drink"] = dr
+    else:
+        t = dr.astype(str).str.strip().str.upper()
+        out["drink"] = t.map({"Y": 1, "N": 0, "YES": 1, "NO": 0, "예": 1, "아니오": 0, "1": 1, "0": 0, "1.0": 1, "0.0": 0})
+        notes.append("음주 Y/N을 1·0으로 바꿨어요.")
+
+    # 말이 안 되는 값 → 빈칸
+    bad = 0
+    for k, (lo, hi) in VALID.items():
+        m = out[k].notna() & ~out[k].between(lo, hi)
+        bad += int(m.sum())
+        out.loc[m, k] = np.nan
+    if bad:
+        notes.append(f"범위를 벗어난 값 {bad:,}개(예: 허리둘레 999)를 빈칸으로 바꿨어요.")
+
+    before = len(out)
+    out = out.dropna(subset=CORE)
+    if len(out) < before:
+        notes.append(f"성별·나이·BMI·허리·혈압·공복혈당 중 빈 값이 있는 {before - len(out):,}명은 뺐어요.")
+    return out.reset_index(drop=True), notes
+
+
 # ---------------------------------------------------------------- 화면
 st.caption("헬스케어 팩 · 담당: 식품영양학과")
 st.title("검진 데이터로 위험군을 나누고, 대사증후군 유형과 당뇨 고위험군에 맞춘 영양 중재까지")
-st.warning("이 화면은 진단이 아니라 선별 시연이에요. 예시 숫자는 시뮬레이션 값이에요.")
-
+data, uploaded = simulate(), False
 with st.expander("데이터 올리기 (선택)"):
-    st.caption("필요한 열: sex(1남·2여), age, bmi, waist, sbp, dbp, fbg, tc, tg, hdl, ggt, smoke(3=현재 흡연), drink(0·1)")
-    st.caption("국민건강보험공단 원본은 열 이름이 달라서, 위 이름으로 바꾼 뒤 올려요.")
+    st.caption("건강검진 CSV를 올리면 열 이름을 자동으로 맞춰요. 국민건강보험공단 원본(한글·영문 열 이름)과 같은 구조의 캐글 데이터 모두 돼요.")
+    st.caption("BMI 열이 없으면 키·몸무게로 계산하고, Male/Female·Y/N·연령대 코드 같은 값도 알아서 바꿔요.")
     up = st.file_uploader("검진 CSV", type="csv")
+    if up:
+        try:
+            raw = read_any_csv(up.getvalue())
+            auto = guess_columns(raw.columns)
+            st.markdown("**열 맞추기** · 자동으로 찾은 결과예요. 틀렸거나 (없음)이면 직접 골라 주세요.")
+            options = [NONE] + list(raw.columns)
+            mapping, grid = {}, st.columns(3)
+            for i, (key, label) in enumerate(FIELDS.items()):
+                default = auto[key] if auto[key] in options else NONE
+                pick = grid[i % 3].selectbox(label, options, index=options.index(default), key=f"map_{key}_{up.name}")
+                mapping[key] = None if pick == NONE else pick
+            miss = missing_fields(mapping)
+            if miss:
+                st.error("아직 못 찾은 항목: " + ", ".join(FIELDS[k] for k in miss) + " · 위 칸에서 직접 골라 주세요.")
+            else:
+                data, notes = build_data(raw, mapping)
+                if len(data) < 50:
+                    st.error(f"분석할 수 있는 사람이 {len(data)}명뿐이라 예시 데이터로 보여줘요. 열을 제대로 골랐는지 확인해 주세요.")
+                    data = simulate()
+                else:
+                    uploaded = True
+                    st.success(f"{len(data):,}명을 읽었어요.")
+                    for n_ in notes:
+                        st.caption("· " + n_)
+        except Exception as e:
+            st.error(f"CSV를 읽지 못했어요: {e}")
 
-data = simulate()
-if up:
-    try:
-        tmp = pd.read_csv(up)
-        need = {"sex", "age", "bmi", "waist", "sbp", "dbp", "fbg", "tc", "tg", "hdl", "ggt", "smoke", "drink"}
-        if need - set(tmp.columns):
-            st.error(f"빠진 열: {sorted(need - set(tmp.columns))}")
-        else:
-            data = tmp[list(need)].dropna(subset=["age", "sex"])
-            st.success(f"{len(data):,}명을 읽었어요.")
-    except Exception as e:
-        st.error(f"CSV를 읽지 못했어요: {e}")
+if uploaded:
+    st.info(f"올린 데이터 {len(data):,}명으로 분석하고 있어요. 진단이 아니라 선별 시연이에요.")
+else:
+    st.warning("이 화면은 진단이 아니라 선별 시연이에요. 예시 숫자는 시뮬레이션 값이에요.")
 
 df = add_mets(add_levels(data))
 t_risk, t_mets, t_dm = st.tabs(["① 위험군 분류", "② 대사증후군 유형", "③ 당뇨 고위험군 선별"])
