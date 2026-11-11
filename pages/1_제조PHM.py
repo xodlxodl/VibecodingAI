@@ -1,6 +1,7 @@
 """제조 PHM (담당: 산공)
 3D 프린터 데이터: Szydlo T. et al. (2021), github.com/joanna-/3D-Printing-Data, CC BY 4.0
-베어링·잔여수명·정비 주기: HTML 시안의 시뮬레이션 결과(data/snap.json)
+베어링: Case Western Reserve University Bearing Data Center 실제 데이터로 계산한 결과(data/bearing_real.json)
+잔여수명·정비 주기: HTML 시안의 시뮬레이션 결과(data/snap.json)
 """
 import io
 import json
@@ -20,11 +21,14 @@ ROOT = Path(__file__).parent.parent
 def load_data():
     snap = json.loads((ROOT / "data" / "snap.json").read_text(encoding="utf-8"))
     prn = json.loads((ROOT / "data" / "prn_data.json").read_text(encoding="utf-8"))
-    return snap, prn
+    bear = json.loads((ROOT / "data" / "bearing_real.json").read_text(encoding="utf-8"))
+    return snap, prn, bear
 
 
-SNAP, PD = load_data()
-B, R, W = SNAP["bearing"], SNAP["rul"], SNAP["home"]["weibull"]
+SNAP, PD, BR = load_data()
+R, W = SNAP["rul"], SNAP["home"]["weibull"]
+BSET = {s["name"]: s for s in BR["sets"]}
+BMAIN = BSET["크기 없는 통계 + 결함 주파수"]
 
 # ---------------------------------------------------------------- 3D 프린터 FDC
 RUNS = [
@@ -284,15 +288,15 @@ rf = next(m for m in R["models"] if m["key"] == "rf")
 base_m = next(m for m in R["models"] if m["key"] == "mean")
 ols = next(m for m in R["models"] if m["key"] == "ols")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("베어링 분류 정확도 (부하 조건 분할)", f"{B['byLoad']['acc']:.1%}")
-c1.caption(f"무작위 분할 {B['random']['acc']:.1%}")
+c1.metric("베어링 분류 정확도 (못 본 부하, 크기 단서 제거)", f"{BMAIN['byLoad']:.1%}")
+c1.caption(f"무작위 분할 {BMAIN['random']:.1%} · 실제 CWRU 데이터")
 c2.metric("3D 프린터 이상, 종류까지 맞힌 수", f"{X0['correct']} / {X0['n']}")
 c2.caption("사례 확인이지 검증이 아니에요")
 c3.metric("잔여수명 RMSE (랜덤포레스트)", f"{rf['rmse']:.1f} 사이클")
 c3.caption(f"평균 수명으로 찍기 {base_m['rmse']:.1f}")
 c4.metric("최적 정비 주기 (고장 비용 5배)", f"{W['Tstar']:.0f} 사이클")
 c4.caption(f"고장 후 교체 대비 {W['saving']:.0%} 절감")
-st.info("3D 프린터는 공개된 실제 데이터(AGH, CC BY 4.0)이고, 베어링·잔여수명·정비 주기는 시뮬레이션 값이에요.")
+st.info("3D 프린터(AGH, CC BY 4.0)와 베어링(케이스웨스턴대 베어링 데이터 센터)은 공개된 실제 데이터이고, 잔여수명·정비 주기는 시뮬레이션 값이에요.")
 
 tab_phone, tab_bear, tab_rul, tab_maint, tab_engine = st.tabs(
     ["프린터 직접 측정", "베어링 진동 진단", "잔여수명 예측", "정비 주기", "3D 프린터 이상 탐지·분류"]
@@ -367,18 +371,55 @@ with tab_bear:
     c.metric("BPFI (내륜)", f"{bpfi:.1f} Hz")
     d.metric("2×BSF (볼)", f"{bsf2:.1f} Hz")
 
-    st.subheader("분류 결과: 나누는 방법이 정확도를 바꿔요")
+    st.subheader("실제 데이터로 확인: 계산한 결함 주파수가 스펙트럼에 있나")
+    sp_key = st.radio("파일", ["130", "105"], horizontal=True,
+                      format_func=lambda k: {"130": "130.mat 외륜 결함 · BPFO", "105": "105.mat 내륜 결함 · BPFI"}[k])
+    sp = BR["spectrum"][sp_key]
+    df_hz = BR["fs"] / sp["N"]
+    freq = (sp["k0"] + 4 * np.arange(len(sp["A"]))) * df_hz
+    fig = go.Figure(go.Scatter(x=freq, y=sp["A"], mode="lines", line=dict(width=1), name="포락선 스펙트럼",
+                               hovertemplate="%{x:.1f} Hz<extra></extra>"))
+    for h in (1, 2, 3, 4):
+        fig.add_vline(x=h * sp["f0"], line_dash="dash", line_color="#eb6834", line_width=1)
+    fig.update_layout(height=300, margin=dict(t=20, b=40), xaxis_title="주파수 (Hz)", yaxis_title="포락선 세기",
+                      xaxis_range=[0, 600], showlegend=False)
+    st.plotly_chart(fig, width="stretch")
     a, b, c = st.columns(3)
-    a.metric("무작위 분할", f"{B['random']['acc']:.1%}", f"시험 {B['random']['nTest']}창", delta_color="off")
-    b.metric("부하 조건 분할", f"{B['byLoad']['acc']:.1%}", f"시험 {B['byLoad']['nTest']}창", delta_color="off")
-    c.metric("누수로 부풀려진 몫", f"{(B['random']['acc'] - B['byLoad']['acc']) * 100:.1f}%p")
+    a.metric("공식으로 계산", f"{sp['f0']:.1f} Hz", f"{sp['rpm']:.0f} rpm", delta_color="off")
+    b.metric("실제 봉우리", f"{sp['found']:.1f} Hz")
+    c.metric("차이", f"{sp['found'] - sp['f0']:+.1f} Hz")
+    st.caption("점선 = 계산한 결함 주파수와 2·3·4배. 2~5 kHz 울림 대역만 남겨 포락선을 구하고 FFT했어요(신호 전체 약 10초).")
+
+    st.subheader("분류 결과: 100%의 이유를 확인했어요")
+    st.caption(f"정상·내륜·볼·외륜 4가지 · 파일 16개(부하 0~3마력) · 창 {BR['nWindows']}개(2048샘플 = 0.17초) · 랜덤포레스트 300그루")
+    acc = pd.DataFrame([{"특징 묶음": s["name"], "무작위 분할": s["random"], "못 본 부하로 시험": s["byLoad"]} for s in BR["sets"]])
+    fig = go.Figure()
+    for col_name, color in (("무작위 분할", "#2a78d6"), ("못 본 부하로 시험", "#eb6834")):
+        fig.add_bar(x=acc["특징 묶음"], y=acc[col_name] * 100, name=col_name, marker_color=color,
+                    text=[f"{v * 100:.1f}" for v in acc[col_name]], textposition="outside")
+    fig.update_layout(barmode="group", height=360, margin=dict(t=30, b=40), yaxis_title="정확도 (%)",
+                      yaxis_range=[70, 104], legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig, width="stretch")
+    st.caption("세로축은 70%부터예요. 못 본 부하로 시험 = 3개 부하로 배우고 남은 1개로 시험, 4번 돌아가며.")
+
+    st.markdown(
+        f"""
+1. **통계 8개도, rms(떨림 크기) 하나만으로도 {BSET['rms 하나만']['byLoad']:.0%}.** 상태마다 떨림 크기 자체가 달라서 이 데이터는 쉬워요.
+2. **크기 단서를 지우면**(파고율·첨도처럼 비율로 된 특징만) 무작위 {BSET['크기 없는 통계 5개']['random']:.1%} → 못 본 부하 {BSET['크기 없는 통계 5개']['byLoad']:.1%}로 떨어져요. 0마력 시험은 {BSET['크기 없는 통계 5개']['perLoad'][0]:.1%}.
+3. **틀린 건 거의 다 정상 ↔ 볼 결함.** 볼 결함 주파수는 스펙트럼에서 잘 안 보여요.
+4. **결함 주파수 특징을 더하면 {BMAIN['byLoad']:.1%}**(+{(BMAIN['byLoad'] - BSET['크기 없는 통계 5개']['byLoad']) * 100:.1f}%p). 내륜·외륜은 이미 완벽하고, 볼 결함은 물리 특징으로도 아직 못 잡아요.
+"""
+    )
+    pick = st.selectbox("혼동행렬 볼 특징 묶음 (못 본 부하로 시험)", list(BSET), index=list(BSET).index("크기 없는 통계 + 결함 주파수"))
     left, right = st.columns(2)
-    for col, key, title in ((left, "random", "무작위 분할"), (right, "byLoad", "부하 조건 분할")):
-        col.caption(f"{title} · 행 = 실제, 열 = 예측")
-        col.dataframe(pd.DataFrame(B[key]["conf"], index=B["classes"], columns=B["classes"]), width="stretch")
-    imp = pd.DataFrame({"특징": B["feats"], "중요도": B["byLoad"]["importance"]}).sort_values("중요도")
+    left.caption(f"{pick} · 행 = 실제, 열 = 예측 · 정확도 {BSET[pick]['byLoad']:.1%}")
+    left.dataframe(pd.DataFrame(BSET[pick]["conf"], index=BR["classes"], columns=BR["classes"]), width="stretch")
+    right.caption("못 본 부하별 정확도")
+    right.dataframe(pd.DataFrame({"시험한 부하(마력)": [0, 1, 2, 3],
+                                  "정확도": [f"{v:.1%}" for v in BSET[pick]["perLoad"]]}).set_index("시험한 부하(마력)"), width="stretch")
+    imp = pd.DataFrame({"특징": BSET[pick]["feats"], "중요도": BSET[pick]["importance"]}).sort_values("중요도")
     st.plotly_chart(go.Figure(go.Bar(x=imp["중요도"], y=imp["특징"], orientation="h")).update_layout(height=280, margin=dict(t=20)), width="stretch")
-    st.caption("무작위로 섞으면 같은 녹음의 조각이 학습과 시험 양쪽에 들어가 정확도가 부풀려져요.")
+    st.caption("데이터: Case Western Reserve University Bearing Data Center, 12k 드라이브 쪽, 결함 크기 0.007인치. 중요도가 크다고 원인이라는 뜻은 아니에요.")
 
 with tab_rul:
     st.subheader("모델 비교")
