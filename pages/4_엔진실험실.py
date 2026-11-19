@@ -93,16 +93,16 @@ def diagnose(res, requested_mode):
     table, out, prof = res["table"], res["out"], res["out"]["profile"]
     n, mode, items = prof["n"], out["mode"], []
 
-    def add(name, status, detail, advice=""):
-        items.append({"항목": name, "상태": status, "내용": detail, "권장": advice})
+    def add(name, status, detail, advice="", key="", **extra):
+        items.append(dict({"항목": name, "상태": status, "내용": detail, "권장": advice, "_key": key}, **extra))
 
-    add("파일 읽기", "좋음", f"{n:,}행 × {len(table['columns'])}열 · 글자 인코딩 {table.get('encoding', '?')}")
+    add("파일 읽기", "좋음", f"{n:,}행 × {len(table['columns'])}열 · 글자 인코딩 {table.get('encoding', '?')}", key="read")
     role_ko = {"numeric": "숫자", "time": "시간", "personal": "개인정보", "label": "정답 라벨", "counter": "번호·순번",
                "constant": "값이 하나뿐", "category": "범주", "text": "글자"}
     skipped = [f"{c['name']}({role_ko.get(c['role'], c['role'])})" for c in prof["cols"]
                if c["name"] not in out["columns"] and c["role"] != "time"]
     add("분석한 열", "좋음", f"{len(out['columns'])}개: {', '.join(out['columns'])}",
-        ("분석에서 뺀 열: " + ", ".join(skipped[:8]) + (" 외" if len(skipped) > 8 else "")) if skipped else "")
+        ("분석에서 뺀 열: " + ", ".join(skipped[:8]) + (" 외" if len(skipped) > 8 else "")) if skipped else "", key="cols")
 
     # 모드가 데이터 모양과 맞는지
     tinfo = prof["time"]
@@ -112,45 +112,49 @@ def diagnose(res, requested_mode):
             per = n / max(1, n - tinfo["dupStamps"])
             add("모드와 데이터 모양", "문제",
                 f"시간 열({tinfo['col']})이 있어 시계열로 돌렸지만, 같은 시각에 평균 {per:.1f}행이 있어요(같은 시각 비율 {same:.0%}).",
-                "한 행이 한 사람·한 건인 기록으로 보여요. 표 모드로 돌리거나, 날짜별로 모은 값(건수·평균)을 시계열로 보세요.")
+                "한 행이 한 사람·한 건인 기록으로 보여요. 표 모드로 돌리거나, 날짜별로 모은 값(건수·평균)을 시계열로 보세요.",
+                key="mode_shape")
         else:
-            add("모드와 데이터 모양", "좋음", f"시간 열 {tinfo['col']} 기준 시계열 · 같은 시각 비율 {same:.0%}")
+            add("모드와 데이터 모양", "좋음", f"시간 열 {tinfo['col']} 기준 시계열 · 같은 시각 비율 {same:.0%}", key="mode")
     elif mode == "timeseries":
-        add("모드와 데이터 모양", "좋음", "시간 열이 없어 행 순서를 시간으로 봤어요(직접 '시계열'을 고름).")
+        add("모드와 데이터 모양", "좋음", "시간 열이 없어 행 순서를 시간으로 봤어요(직접 '시계열'을 고름).", key="mode")
     else:
         note = "시간 열이 없어 자동으로 표 모드가 됐어요." if requested_mode == "auto" else "표 모드로 돌렸어요."
         add("모드와 데이터 모양", "좋음", note + " 행마다 따로 이상치를 찾고 이벤트로 묶지 않아요.",
-            "센서처럼 행 순서가 시간이라면 '시계열'을 고르세요." if requested_mode == "auto" else "")
+            "센서처럼 행 순서가 시간이라면 '시계열'을 고르세요." if requested_mode == "auto" else "", key="mode")
 
     # 이름표 같은 숫자 열
-    codes = []
+    codes, code_names = [], []
     for name in out["columns"]:
         is_code, lead0 = _looks_like_code(table, name)
         if is_code:
+            code_names.append(name)
             codes.append(f"{name}" + (f"(앞자리 0 {lead0:.0%})" if lead0 >= 0.3 else ""))
     if codes:
         add("이름표 같은 숫자 열", "주의", "숫자 크기에 뜻이 없을 수 있는 열을 숫자로 분석했어요: " + ", ".join(codes),
-            "센터·지역·상품 코드라면 위의 '분석할 열'에서 빼세요.")
+            "센터·지역·상품 코드라면 위의 '분석할 열'에서 빼세요.", key="code_cols", _cols=code_names)
     else:
-        add("이름표 같은 숫자 열", "좋음", "코드·번호처럼 보이는 열은 분석하지 않았어요.")
+        add("이름표 같은 숫자 열", "좋음", "코드·번호처럼 보이는 열은 분석하지 않았어요.", key="code_cols")
 
     # 중복 행
     dup = prof["duplicates"]
     if mode == "timeseries" and dup / max(1, n) > 0.01:
         add("중복 행", "주의", f"완전히 같은 행 {dup:,}개({dup / n:.1%})를 빼고 분석했어요.",
-            "같은 값의 서로 다른 사람·건이라면 빼면 안 돼요. 표 모드는 중복을 빼지 않아요.")
+            "같은 값의 서로 다른 사람·건이라면 빼면 안 돼요. 표 모드는 중복을 빼지 않아요.", key="dup")
     else:
-        add("중복 행", "좋음", f"완전히 같은 행 {dup:,}개" + (" (표 모드라 빼지 않음)" if mode == "table" and dup else ""))
+        add("중복 행", "좋음", f"완전히 같은 행 {dup:,}개" + (" (표 모드라 빼지 않음)" if mode == "table" and dup else ""), key="dup")
 
     # 빈칸
     miss = [(c["name"], c["missing"] / max(1, n)) for c in prof["cols"] if c["name"] in out["columns"]]
     worst = max(miss, key=lambda x: x[1]) if miss else ("", 0)
     if worst[1] >= 0.5:
-        add("빈칸", "문제", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "빈칸이 많은 열은 분석 열에서 빼세요.")
+        add("빈칸", "문제", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "빈칸이 많은 열은 분석 열에서 빼세요.",
+            key="missing", _cols=[w for w, r in miss if r >= 0.5])
     elif worst[1] >= 0.2:
-        add("빈칸", "주의", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "시계열은 빈칸을 앞뒤 값으로 채워서 봐요.")
+        add("빈칸", "주의", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "시계열은 빈칸을 앞뒤 값으로 채워서 봐요.",
+            key="missing", _cols=[w for w, r in miss if r >= 0.2])
     else:
-        add("빈칸", "좋음", f"분석 열의 빈칸 비율 최대 {worst[1]:.1%}")
+        add("빈칸", "좋음", f"분석 열의 빈칸 비율 최대 {worst[1]:.1%}", key="missing")
 
     # 잡힌 비율
     rows = out["result"]["rows"]
@@ -166,9 +170,9 @@ def diagnose(res, requested_mode):
         too_many = ratio > 0.05
     if too_many:
         add("잡힌 양", "주의", detail + "로 많은 편이에요.",
-            "정상 데이터에서도 많이 잡히면 결과를 믿기 어려워요. '기준값 k' 탭에서 k를 키운 결과를 보세요.")
+            "정상 데이터에서도 많이 잡히면 결과를 믿기 어려워요. '기준값 k' 탭에서 k를 키운 결과를 보세요.", key="flags")
     else:
-        add("잡힌 양", "좋음", detail)
+        add("잡힌 양", "좋음", detail, key="flags")
 
     # 기준 구간 대표성(시계열): 앞 30%와 나머지의 수준 차이
     if mode == "timeseries":
@@ -182,16 +186,16 @@ def diagnose(res, requested_mode):
                     moved.append(f"{c['name']}({shift:.1f}σ)")
         if moved:
             add("기준 구간", "주의", f"엔진은 앞쪽 {nb:,}행을 정상 기준으로 삼는데, 나머지 구간의 수준이 크게 달라요: " + ", ".join(moved),
-                "앞부분이 정상 운전이 아니면 이벤트가 많이 나와요. 정상 구간이 앞에 오도록 파일을 자르세요.")
+                "앞부분이 정상 운전이 아니면 이벤트가 많이 나와요. 정상 구간이 앞에 오도록 파일을 자르세요.", key="baseline")
         else:
-            add("기준 구간", "좋음", f"앞쪽 {nb:,}행을 정상 기준으로 삼았고, 나머지 구간과 수준 차이가 크지 않아요.")
+            add("기준 구간", "좋음", f"앞쪽 {nb:,}행을 정상 기준으로 삼았고, 나머지 구간과 수준 차이가 크지 않아요.", key="baseline")
 
     if n < 100:
-        add("행 수", "주의", f"{n}행뿐이라 판정이 흔들릴 수 있어요.", "가능하면 수백 행 이상을 넣으세요.")
+        add("행 수", "주의", f"{n}행뿐이라 판정이 흔들릴 수 있어요.", "가능하면 수백 행 이상을 넣으세요.", key="rows")
     if res["seconds"] > 20:
-        add("실행 시간", "주의", f"한 번 분석에 {res['seconds']}초 걸렸어요.", f"{BIG_ROWS:,}행이 넘으면 필요한 기간·열만 잘라서 넣는 게 좋아요.")
+        add("실행 시간", "주의", f"한 번 분석에 {res['seconds']}초 걸렸어요.", f"{BIG_ROWS:,}행이 넘으면 필요한 기간·열만 잘라서 넣는 게 좋아요.", key="time")
     else:
-        add("실행 시간", "좋음", f"한 번 분석에 {res['seconds']}초")
+        add("실행 시간", "좋음", f"한 번 분석에 {res['seconds']}초", key="time")
     return items
 
 
@@ -547,6 +551,128 @@ def verdict_text(S):
     return "\n".join(lines)
 
 
+# ================================================================ 3-1. 이렇게 바꿔 보세요 (판정이 나쁠 때 고칠 방법)
+MODE_LABEL = {"auto": "자동", "timeseries": "시계열 (행 순서 = 시간)", "table": "표 (한 행 = 한 건)"}
+
+
+@st.cache_resource(max_entries=4, show_spinner=False)
+def date_aggregate(data: bytes):
+    """같은 시각에 여러 행이 있는 기록을 시각별로 모음: 건수 + 숫자 열의 평균 (코드 같은 열은 뺌) → 새 CSV 바이트"""
+    table, prof = file_profile(data)
+    tcol = prof["time"]["col"]
+    df = pd.DataFrame(table["rows"], columns=table["columns"])
+    when = pd.to_datetime(df[tcol], errors="coerce")
+    agg = pd.DataFrame({tcol: when})
+    used = []
+    for c in prof["cols"]:
+        if c["role"] == "numeric" and not _looks_like_code(table, c["name"])[0]:
+            agg[f"평균_{c['name']}"] = pd.to_numeric(df[c["name"]].astype(str).str.replace(",", ""), errors="coerce")
+            used.append(c["name"])
+    g = agg.dropna(subset=[tcol]).groupby(tcol)
+    outdf = g.size().rename("건수").to_frame().join(g.mean(numeric_only=True)).reset_index()
+    outdf[tcol] = outdf[tcol].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return outdf.round(4).to_csv(index=False).encode("utf-8"), used, len(outdf)
+
+
+def suggest_fixes(diag, out, kbest, k, cols_now, agg_on):
+    """진단 결과마다 고칠 방법을 붙여요.
+    설정: 버튼 하나로 바꿔 다시 점검 · 데이터 바꾸기: 페이지가 데이터를 새로 만들어 보여 줌(질문이 바뀜) · 데이터 준비: 사용자가 해야 함"""
+    bad = {d["_key"]: d for d in diag if d["상태"] != "좋음"}
+    fixes, combo = [], {}
+    cur_cols = list(cols_now) or list(out["columns"])
+    if "mode_shape" in bad:
+        fixes.append({"종류": "설정", "제목": "표 모드로 다시 점검", "apply": {"mode": "table"}, "짧게": "표 모드",
+                      "이유": "한 행이 한 사람·한 건인 기록이라 행마다 따로 보는 표 모드가 맞아요. 같은 값의 행도 빼지 않아요."})
+        combo["mode"] = "table"
+        if not agg_on:
+            fixes.append({"종류": "데이터 바꾸기", "제목": "시각별로 모아서 시계열로 보기", "apply": {"agg": True},
+                          "이유": "같은 시각의 행을 모아 '건수'와 숫자 열의 평균으로 바꾼 뒤 시계열로 봐요. "
+                                  "'이상한 사람'이 아니라 '평소와 다른 날'을 찾는 질문으로 바뀌어요."})
+    elif "dup" in bad and out["mode"] == "timeseries":
+        fixes.append({"종류": "설정", "제목": "표 모드로 다시 점검 (중복 행 유지)", "apply": {"mode": "table"}, "짧게": "표 모드",
+                      "이유": "시계열 모드는 완전히 같은 행을 빼요. 서로 다른 사람·건이라면 표 모드로 봐야 해요."})
+        combo["mode"] = "table"
+    drop = []
+    if "code_cols" in bad:
+        drop += bad["code_cols"].get("_cols", [])
+    if "missing" in bad:
+        drop += bad["missing"].get("_cols", [])
+    drop = list(dict.fromkeys(drop))
+    keep = [c for c in cur_cols if c not in drop]
+    if drop and keep:
+        fixes.append({"종류": "설정", "제목": f"{', '.join(drop)} 빼고 다시 점검", "apply": {"cols": keep}, "짧게": f"{', '.join(drop)} 빼기",
+                      "이유": "코드·번호처럼 숫자 크기에 뜻이 없거나 빈칸이 많은 열은 엔진 판정을 흐려요."})
+        combo["cols"] = keep
+    elif drop:
+        fixes.append({"종류": "데이터 준비", "제목": "분석할 숫자 열이 있는 파일 준비",
+                      "이유": f"문제 있는 열({', '.join(drop)})을 빼면 남는 숫자 열이 없어요. 값의 크기에 뜻이 있는 숫자 열이 필요해요."})
+    if "flags" in bad:
+        bigger = kbest["k"] if kbest["k"] > k else next((x for x in K_GRID if x > k), None)
+        if bigger:
+            fixes.append({"종류": "설정", "제목": f"k = {bigger}로 다시 점검", "apply": {"k": bigger}, "짧게": f"k {bigger}",
+                          "이유": f"정상 데이터에서도 많이 잡혀요. k를 키우면 덜 민감해져요(지금 k = {k})."})
+            combo["k"] = bigger
+    if "baseline" in bad:
+        fixes.append({"종류": "데이터 준비", "제목": "정상 구간이 앞에 오도록 파일 자르기",
+                      "이유": "엔진은 앞쪽 30%를 정상 기준으로 삼아요. 고장·시운전 구간이 앞에 있으면 그 뒤가 전부 이상해 보여요."})
+    if "rows" in bad:
+        fixes.append({"종류": "데이터 준비", "제목": "행을 더 모으기", "이유": "행이 적으면 판정이 흔들려요. 수백 행 이상을 권해요."})
+    if "missing" in bad and bad["missing"]["상태"] == "문제" and not keep:
+        fixes.append({"종류": "데이터 준비", "제목": "빈칸을 채운 파일 준비", "이유": bad["missing"]["내용"]})
+    if "mode" in combo and "k" in combo:
+        combo.pop("k")   # 추천 k는 지금 모드에서 잰 값이라, 모드를 바꿀 때는 같이 묶지 않음
+    parts = [f for f in fixes if f["종류"] == "설정" and set(f["apply"]) <= set(combo)]
+    if len(parts) >= 2:
+        fixes.insert(0, {"종류": "설정", "제목": "추천 설정 모두 적용해서 다시 점검", "apply": dict(combo),
+                         "이유": " + ".join(f["짧게"] for f in parts)
+                                 + (" (k는 모드를 바꾼 뒤 다시 점검해서 정하세요)" if any("k" in f["apply"] for f in fixes) and "mode" in combo else "")})
+    return fixes
+
+
+def apply_fix(change):
+    """버튼 콜백: 위쪽 설정 위젯 값을 바꾼 뒤 페이지가 다시 돌아요(원래 판정은 점검 기록에 남음)."""
+    if "mode" in change:
+        st.session_state["mode_label"] = MODE_LABEL[change["mode"]]
+    if "cols" in change:
+        st.session_state["cols_pick"] = list(change["cols"])
+    if "k" in change:
+        st.session_state["k_val"] = change["k"]
+    if change.get("agg") is True:
+        st.session_state["agg_for"] = st.session_state.get("_orig_hash")
+        if "mode" not in change:
+            st.session_state["mode_label"] = MODE_LABEL["timeseries"]
+        if "cols" not in change:
+            st.session_state["cols_pick"] = []
+    elif change.get("agg") is False:
+        st.session_state.pop("agg_for", None)
+    st.session_state.pop("target", None)
+
+
+def leave_agg():
+    st.session_state.pop("agg_for", None)
+    st.session_state["mode_label"] = MODE_LABEL["auto"]
+    st.session_state["cols_pick"] = []
+    st.session_state.pop("target", None)
+
+
+GRADE_RANK = {"잘 맞음": 2, "주의 필요": 1, "맞지 않음": 0}
+
+
+def record_history(orig_hash, setting, grade, big, warns, apply):
+    """이 파일로 해 본 설정과 판정을 쌓아 둠. _apply = 그 설정으로 돌아갈 때 쓸 값"""
+    hist = st.session_state.setdefault("history", {}).setdefault(orig_hash, [])
+    if not any(h["설정"] == setting for h in hist):
+        hist.append({"순서": len(hist) + 1, "설정": setting, "판정": grade, "큰 이상 재현율": f"{big:.0%}", "진단 경고": warns,
+                     "_big": big, "_apply": apply})
+    return hist
+
+
+def best_of(hist, agg_on):
+    """원래 데이터끼리, 시각별 모음끼리만 비교 (둘은 묻는 질문이 달라서)"""
+    same = [h for h in hist if h["_apply"]["agg"] == agg_on]
+    return max(same, key=lambda h: (GRADE_RANK[h["판정"]], -h["진단 경고"], h["_big"]))
+
+
 # ---------------------------------------------------------------- AI 호출 (비용 장치 포함)
 def ai_settings():
     """Secrets에서 키와 모델을 읽어요. secrets.toml이 없으면 st.secrets 접근 자체가 오류라 감싸요."""
@@ -687,23 +813,44 @@ if data is None:
     st.info("CSV를 올리면 분석이 시작돼요. 센서처럼 시간 순서가 있는 데이터도, 한 행이 한 사람·한 건인 표도 돼요.")
     st.stop()
 
+orig_hash = hashlib.sha256(data).hexdigest()[:16]
+st.session_state["_orig_hash"] = orig_hash
+if st.session_state.get("_last_file") != orig_hash:          # 새 파일이면 설정을 처음으로
+    st.session_state["_last_file"] = orig_hash
+    for key_ in ("cols_pick", "target", "agg_for"):
+        st.session_state.pop(key_, None)
+    st.session_state["mode_label"] = MODE_LABEL["auto"]
+    st.session_state["k_val"] = 1.0
+
 try:
     with st.spinner("파일을 읽는 중이에요…"):
         table0, prof0 = file_profile(data)
+        agg_on = st.session_state.get("agg_for") == orig_hash and bool(prof0["time"])
+        if agg_on:   # '시각별로 모아서 보기'를 고른 경우: 모은 데이터로 바꿔서 점검
+            data, agg_used, agg_n = date_aggregate(data)
+            fname = f"{fname} (시각별 모음)"
+            table0, prof0 = file_profile(data)
 except ValueError as e:
     st.error(str(e))
     st.stop()
+
+if agg_on:
+    st.info(f"지금은 원래 파일을 **시각별로 모은 데이터**({agg_n:,}행: 건수 + {', '.join(agg_used) or '숫자 열 없음'}의 평균)를 점검하고 있어요. "
+            "'이상한 사람'이 아니라 '평소와 다른 날'을 찾는 질문이에요.")
+    st.button("원래 파일로 돌아가기", on_click=leave_agg)
 
 n_rows = prof0["n"]
 if n_rows > BIG_ROWS:
     st.warning(f"{n_rows:,}행짜리 큰 파일이에요. 처음 분석은 수십 초 걸릴 수 있어요(같은 설정으로 다시 볼 때는 바로 떠요).")
 
 c1, c2, c3 = st.columns([2, 1, 3])
-mode_ko = {"자동": "auto", "시계열 (행 순서 = 시간)": "timeseries", "표 (한 행 = 한 건)": "table"}
-mode_label = c1.radio("모드", list(mode_ko), horizontal=True,
+mode_ko = {v: kk for kk, v in MODE_LABEL.items()}
+options = numeric_options(prof0)
+st.session_state["cols_pick"] = [x for x in st.session_state.get("cols_pick", []) if x in options]   # 없는 열 정리
+mode_label = c1.radio("모드", list(mode_ko), horizontal=True, key="mode_label",
                       help="자동: 시간 열이 있으면 시계열, 없으면 표. 시간 열 없이 행 순서가 시간인 센서 데이터는 '시계열'을 고르세요.")
-k = c2.select_slider("민감도 k (크면 덜 민감)", options=K_GRID, value=1.0)
-cols_pick = c3.multiselect("분석할 열 (비워 두면 엔진이 골라요)", numeric_options(prof0),
+k = c2.select_slider("민감도 k (크면 덜 민감)", options=K_GRID, key="k_val")
+cols_pick = c3.multiselect("분석할 열 (비워 두면 엔진이 골라요)", options, key="cols_pick",
                            help="코드·번호처럼 숫자 크기에 뜻이 없는 열은 빼세요.")
 mode = mode_ko[mode_label]
 cols_key = tuple(cols_pick)
@@ -717,7 +864,9 @@ except ValueError as e:
 out = res["out"]
 diag = diagnose(res, mode)
 
-target = st.selectbox("이상 심기 실험에 쓸 열", out["columns"],
+if st.session_state.get("target") not in out["columns"]:
+    st.session_state.pop("target", None)
+target = st.selectbox("이상 심기 실험에 쓸 열", out["columns"], key="target",
                       help="이 열의 실제 값 위에 이상을 하나씩 심고 엔진이 잡는지 최대 240번 봐요(음수가 되는 실험은 빼요).")
 with st.spinner("이상을 240번 심어 보고, 기준값 k를 바꿔 보는 중이에요… (큰 파일이면 30초쯤)"):
     trials = run_trials(data, mode, k, cols_key, fname, target)
@@ -728,6 +877,10 @@ ver = verifier_check(out)
 S = fitness_summary(res, diag, trials, kpts, kbest, rz_rows, ver, k)
 grade, _, _ = grade_of(S)
 sc = trial_scores(trials["recs"])
+setting_desc = (f"{'시각별 모음 · ' if agg_on else ''}{'시계열' if out['mode'] == 'timeseries' else '표'} 모드 · k {k} · "
+                f"열 {', '.join(cols_pick) if cols_pick else '엔진 자동(' + ', '.join(out['columns']) + ')'}")
+history = record_history(orig_hash, setting_desc, grade, sc["큰_이상_재현율"], sum(x["상태"] != "좋음" for x in diag),
+                         {"mode": mode, "cols": list(cols_pick), "k": k, "agg": agg_on})
 
 # ---------------------------------------------------------------- 요약 지표
 a, b, c, d = st.columns(4)
@@ -760,7 +913,8 @@ with t_run:
 
 with t_diag:
     st.subheader("이 파일이 엔진의 전제와 맞는지")
-    st.dataframe(pd.DataFrame([dict(x, 상태=STATUS_ICON[x["상태"]]) for x in diag]), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame([{kk: (STATUS_ICON[v] if kk == "상태" else v) for kk, v in x.items() if not kk.startswith("_")} for x in diag]),
+                 width="stretch", hide_index=True)
     st.caption("❌ 문제 = 이대로는 결과를 믿기 어려움 · ⚠️ 주의 = 결과를 읽을 때 감안 · ✅ 좋음")
 
 with t_inject:
@@ -887,6 +1041,39 @@ else:
                 st.markdown(f"**{i}번째** · " + (f"요약에 없는 숫자: {', '.join(bad)}" if bad else "통과"))
     else:
         st.markdown(base_verdict)
+
+# ---------------------------------------------------------------- 3-1. 이렇게 바꿔 보세요
+fixes = suggest_fixes(diag, out, kbest, k, cols_pick, agg_on)
+st.subheader("이렇게 바꿔 보세요")
+if not fixes:
+    st.success("진단에서 고칠 점이 나오지 않았어요. 지금 설정 그대로 써도 돼요.")
+else:
+    if grade == "잘 맞음":
+        st.caption("판정은 좋지만, 진단에서 손볼 만한 점이 있어요.")
+    st.caption("원래 판정은 아래 '점검 기록'에 남아요. 버튼을 누르면 위의 설정이 바뀌고 같은 파일로 처음부터 다시 점검해요.")
+    kind_icon = {"설정": "🔧 설정만 바꾸면 돼요", "데이터 바꾸기": "🔄 페이지가 데이터를 바꿔서 보여 줘요", "데이터 준비": "📁 파일을 손봐서 다시 올려야 해요"}
+    for i, f in enumerate(fixes):
+        with st.container(border=True):
+            l, r = st.columns([4, 1])
+            l.markdown(f"**{f['제목']}**  \n{kind_icon[f['종류']]} · {f['이유']}")
+            if f.get("apply"):
+                r.button("적용해서 다시 점검", key=f"fix_{i}", on_click=apply_fix, args=(f["apply"],), type="primary" if i == 0 else "secondary")
+    weak_engine = [f"{kind} {size}" for kind, d in S["이상_심기"]["종류별_크기별_재현율_퍼센트"].items() for size, v in d.items()
+                   if v < 50 and size.endswith("σ") and float(size[:-1]) >= 4]
+    if weak_engine:
+        st.caption(f"참고: {', '.join(weak_engine)}처럼 큰 이상도 잘 못 잡는 건 엔진 방식의 한계라 설정이나 데이터를 바꿔도 크게 달라지지 않아요.")
+
+if len(history) > 1:
+    st.markdown("**점검 기록 (이 파일)**")
+    st.dataframe(pd.DataFrame([{kk: v for kk, v in h.items() if not kk.startswith("_")} for h in history]), width="stretch", hide_index=True)
+    first, now, best = history[0], next(h for h in history if h["설정"] == setting_desc), best_of(history, agg_on)
+    msg = f"처음 설정: **{first['판정']}** → 지금 설정: **{now['판정']}**."
+    if best["설정"] == now["설정"]:
+        msg += " 지금 설정이 해 본 것 중 가장 좋아요. 다른 분야 페이지에서 이 파일을 쓸 때도 이 설정을 쓰세요."
+        st.caption(msg)
+    else:
+        st.caption(msg + f" {'시각별 모음' if agg_on else '원래 데이터'}로 해 본 것 중에는 {best['순서']}번째 설정({best['판정']})이 더 좋았어요.")
+        st.button(f"{best['순서']}번째 설정으로 돌아가기", on_click=apply_fix, args=(best["_apply"],))
 
 with st.expander("AI 사용 원칙과 비용 장치"):
     st.markdown("**보내지 않음**: 원본 행, 이름·연락처·주민번호 열, 한 사람·한 건 단위의 값  \n"
