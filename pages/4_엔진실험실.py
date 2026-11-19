@@ -1,15 +1,18 @@
 """엔진 실험실 (담당: 수학과 B)
-이상 심어 보기 · 240회 실험 결과 · 기준값 k · 숫자 검증기 · robust Z 손 재현.
-240회 실험과 k 곡선, 검증기 시험 결과는 HTML 시안에 저장된 값(data/snap.json)을 그대로 보여 줘요.
-'이상 심어 보기'는 단순 robust Z 탐지기와 공용 엔진(시계열 모드, 4개 방법 합의)을 골라 돌려 볼 수 있어요.
-공용 엔진 v1.1부터 시간 열이 없으면 자동으로 표 모드가 되므로, 행 순서가 시간인 데이터는 mode="timeseries"를 꼭 지정해요.
-AI 리포트: 엔진 요약(원본 행 없음)만 AI에게 보내고, 리포트 속 숫자를 verify_numbers로 대조해 틀리면 최대 2번 다시 쓰게 해요.
-API 키는 Streamlit Secrets의 ANTHROPIC_API_KEY에 넣어요(코드·저장소에 넣지 않음). 키가 없으면 '가짜 AI'로 흐름만 시험할 수 있어요.
+내 CSV 하나를 올리면, 그 파일이 공용 엔진에서 제대로 돌아가는지 점검해요.
+1) CSV 입력 → 2) 탭별 점검(기본 실행 · 데이터 진단 · 이상 심기 240회 · 기준값 k · robust Z 대조 · 숫자 검증기) → 3) 종합 판정(AI 리포트).
+모든 점검은 올린 파일의 실제 값으로 그 자리에서 계산해요. 같은 파일·같은 설정이면 저장해 둔 결과를 다시 써요.
+AI 리포트: 점검 요약(원본 행 없음)만 AI에게 보내고, 리포트 속 숫자를 verify_numbers로 대조해 틀리면 최대 2번 다시 쓰게 해요.
+API 키는 Streamlit Secrets의 ANTHROPIC_API_KEY에 넣어요(코드·저장소에 넣지 않음). 키가 없으면 기본 판정과 '가짜 AI'로 흐름만 시험할 수 있어요.
 """
+import datetime
 import hashlib
 import json
+import math
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -22,33 +25,529 @@ import streamlit as st
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from engine import check_table, events_table, load_csv, report_text, run_engine, verify_numbers  # noqa: E402
+from engine import check_table, events_table, load_csv, profile, report_text, run_engine, verify_numbers  # noqa: E402
 
 st.set_page_config(page_title="엔진 실험실", layout="wide")
 
-# ---------------------------------------------------------------- AI 리포트 설정 ('AI 전송 설계' 탭의 장치를 코드로 옮긴 것)
+# ---------------------------------------------------------------- 설정
+SAMPLES = {"3D 프린터 센서 (시계열)": "printer.csv", "식품 공정 (시계열)": "food.csv", "일반 표": "generic.csv"}
+TS_WINDOW = 600            # 이상 심기 실험에 쓰는 구간 길이(시계열)
+TABLE_SAMPLE = 1500        # 이상 심기 실험에 쓰는 표본 행 수(표)
+REPS = 20                  # 칸마다 반복 수 → 4종류 × 3크기 × 20 = 240회(시계열), 3종류 × 4크기 × 20 = 240회(표)
+TS_KINDS = ["튀는 값", "수준 이동", "변동성 증가", "서서히 흐름"]
+TS_SIZES = [2, 4, 6]
+TABLE_KINDS = ["높은 쪽 극단값", "낮은 쪽 극단값", "자릿수 실수"]
+TABLE_SIZES = {"높은 쪽 극단값": [2, 3, 4, 6], "낮은 쪽 극단값": [2, 3, 4, 6], "자릿수 실수": ["×10", "×100", "÷10", "÷100"]}
+K_GRID = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
+BIG_ROWS = 50000
+CODE_NAME_RE = re.compile(r"코드|번호|구분|ID|Id|id|code|Code|no\.?$|No\.?$")
+BLUE, ORANGE, GRAY = "#2a78d6", "#eb6834", "#9a9890"
+
 AI_URL = "https://api.anthropic.com/v1/messages"
 AI_DEFAULT_MODEL = "claude-haiku-5-5"   # Secrets의 AI_MODEL로 바꿀 수 있음
 AI_MAX_RETRIES = 2                      # 틀린 숫자 다시 쓰기 최대 2번
-AI_CALL_LIMIT = 20                      # 접속(세션)당 호출 20번 상한
+AI_CALL_LIMIT = 20                      # 접속(세션)당 호출 상한
+AI_GLOBAL_LIMIT = 200                   # 앱 전체(모든 접속 합계) 하루 호출 상한 — 새로고침으로 세션 상한을 우회하는 것 막기
+AI_MAX_TOKENS = 3000                    # 5개 절 한국어 리포트가 잘리지 않을 만큼
 AI_SYSTEM = (
-    "너는 데이터 분석 결과를 비전문가에게 설명하는 한국어 리포트 작성자다. "
-    "사용자가 주는 JSON 요약에 있는 숫자만 쓰고, 새 숫자를 계산하거나 지어내지 마라. "
-    "통계적 이상은 원인을 확정하지 않는다는 한계를 반드시 적어라. "
-    "형식: ## 요약 / ## 주요 이상 / ## 가능한 원인 / ## 권장 조치 / ## 한계 (마크다운)."
+    "너는 이상 탐지 엔진이 특정 데이터 파일에서 제대로 작동하는지 비전문가에게 판정해 주는 한국어 리포트 작성자다. "
+    "사용자가 주는 JSON 점검 요약에 있는 숫자만 쓰고, 새 숫자를 계산하거나 지어내지 마라. "
+    "점검 결과는 심어 본 이상과 통계 대조에 근거한 것이며 실제 이상의 원인을 확정하지 않는다는 한계를 반드시 적어라. "
+    "형식: ## 한 줄 판정 / ## 잘 되는 것 / ## 주의할 것 / ## 권장 설정 / ## 한계 (마크다운)."
 )
-AI_USER = "다음은 이상 탐지 엔진의 계산 결과 요약이다. 원본 데이터는 없다.\n\n```json\n{summary}\n```\n\n이 요약만으로 리포트를 써라."
+AI_USER = "다음은 내 CSV 파일을 공용 이상 탐지 엔진으로 점검한 결과 요약이다. 원본 데이터는 없다.\n\n```json\n{summary}\n```\n\n이 요약만으로 엔진이 이 파일에서 믿을 만한지 판정하는 리포트를 써라."
 AI_FIX = "다음 숫자는 요약에 없다: {bad}. 요약에 있는 숫자만 써서 리포트 전체를 다시 써라."
 
 
-@st.cache_data
-def load_lab():
-    return json.loads((ROOT / "data" / "snap.json").read_text(encoding="utf-8"))["lab"]
+# ================================================================ 1. 파일 읽기 · 엔진 실행 (저장해 두고 다시 씀)
+@st.cache_resource(max_entries=4, show_spinner=False)
+def file_profile(data: bytes):
+    table = load_csv(data)
+    return table, profile(table)
 
 
-L = load_lab()
+@st.cache_resource(max_entries=4, show_spinner=False)
+def analyze_file(data: bytes, mode: str, k: float, columns: tuple, name: str):
+    t0 = time.time()
+    table, _ = file_profile(data)
+    out = run_engine(table, columns=list(columns) or None, mode=mode, k=k, dataset_name=name)
+    return {"table": table, "out": out, "seconds": round(time.time() - t0, 1)}
 
 
+def numeric_options(prof):
+    """분석 열로 고를 수 있는 열(값이 숫자인 열)"""
+    return [c["name"] for c in prof["cols"] if c.get("stats") and c["role"] != "time"]
+
+
+# ================================================================ 2-1. 데이터 진단
+def _looks_like_code(table, col_name):
+    """앞자리 0(010, 007)이 많거나 이름에 코드·번호·구분·ID가 있으면 '이름표 같은 숫자'일 수 있음"""
+    ci = table["columns"].index(col_name)
+    vals = [str(r[ci]).strip() for r in table["rows"][:5000] if str(r[ci]).strip()]
+    lead0 = sum(1 for v in vals if re.match(r"^0\d", v)) / max(1, len(vals))
+    return lead0 >= 0.3 or bool(CODE_NAME_RE.search(col_name)), lead0
+
+
+def diagnose(res, requested_mode):
+    """파일이 엔진에 맞는지 항목별로 점검. 상태: 좋음 / 주의 / 문제"""
+    table, out, prof = res["table"], res["out"], res["out"]["profile"]
+    n, mode, items = prof["n"], out["mode"], []
+
+    def add(name, status, detail, advice=""):
+        items.append({"항목": name, "상태": status, "내용": detail, "권장": advice})
+
+    add("파일 읽기", "좋음", f"{n:,}행 × {len(table['columns'])}열 · 글자 인코딩 {table.get('encoding', '?')}")
+    role_ko = {"numeric": "숫자", "time": "시간", "personal": "개인정보", "label": "정답 라벨", "counter": "번호·순번",
+               "constant": "값이 하나뿐", "category": "범주", "text": "글자"}
+    skipped = [f"{c['name']}({role_ko.get(c['role'], c['role'])})" for c in prof["cols"]
+               if c["name"] not in out["columns"] and c["role"] != "time"]
+    add("분석한 열", "좋음", f"{len(out['columns'])}개: {', '.join(out['columns'])}",
+        ("분석에서 뺀 열: " + ", ".join(skipped[:8]) + (" 외" if len(skipped) > 8 else "")) if skipped else "")
+
+    # 모드가 데이터 모양과 맞는지
+    tinfo = prof["time"]
+    if mode == "timeseries" and tinfo:
+        same = tinfo["dupStamps"] / max(1, n)
+        if same >= 0.2:
+            per = n / max(1, n - tinfo["dupStamps"])
+            add("모드와 데이터 모양", "문제",
+                f"시간 열({tinfo['col']})이 있어 시계열로 돌렸지만, 같은 시각에 평균 {per:.1f}행이 있어요(같은 시각 비율 {same:.0%}).",
+                "한 행이 한 사람·한 건인 기록으로 보여요. 표 모드로 돌리거나, 날짜별로 모은 값(건수·평균)을 시계열로 보세요.")
+        else:
+            add("모드와 데이터 모양", "좋음", f"시간 열 {tinfo['col']} 기준 시계열 · 같은 시각 비율 {same:.0%}")
+    elif mode == "timeseries":
+        add("모드와 데이터 모양", "좋음", "시간 열이 없어 행 순서를 시간으로 봤어요(직접 '시계열'을 고름).")
+    else:
+        note = "시간 열이 없어 자동으로 표 모드가 됐어요." if requested_mode == "auto" else "표 모드로 돌렸어요."
+        add("모드와 데이터 모양", "좋음", note + " 행마다 따로 이상치를 찾고 이벤트로 묶지 않아요.",
+            "센서처럼 행 순서가 시간이라면 '시계열'을 고르세요." if requested_mode == "auto" else "")
+
+    # 이름표 같은 숫자 열
+    codes = []
+    for name in out["columns"]:
+        is_code, lead0 = _looks_like_code(table, name)
+        if is_code:
+            codes.append(f"{name}" + (f"(앞자리 0 {lead0:.0%})" if lead0 >= 0.3 else ""))
+    if codes:
+        add("이름표 같은 숫자 열", "주의", "숫자 크기에 뜻이 없을 수 있는 열을 숫자로 분석했어요: " + ", ".join(codes),
+            "센터·지역·상품 코드라면 위의 '분석할 열'에서 빼세요.")
+    else:
+        add("이름표 같은 숫자 열", "좋음", "코드·번호처럼 보이는 열은 분석하지 않았어요.")
+
+    # 중복 행
+    dup = prof["duplicates"]
+    if mode == "timeseries" and dup / max(1, n) > 0.01:
+        add("중복 행", "주의", f"완전히 같은 행 {dup:,}개({dup / n:.1%})를 빼고 분석했어요.",
+            "같은 값의 서로 다른 사람·건이라면 빼면 안 돼요. 표 모드는 중복을 빼지 않아요.")
+    else:
+        add("중복 행", "좋음", f"완전히 같은 행 {dup:,}개" + (" (표 모드라 빼지 않음)" if mode == "table" and dup else ""))
+
+    # 빈칸
+    miss = [(c["name"], c["missing"] / max(1, n)) for c in prof["cols"] if c["name"] in out["columns"]]
+    worst = max(miss, key=lambda x: x[1]) if miss else ("", 0)
+    if worst[1] >= 0.5:
+        add("빈칸", "문제", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "빈칸이 많은 열은 분석 열에서 빼세요.")
+    elif worst[1] >= 0.2:
+        add("빈칸", "주의", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "시계열은 빈칸을 앞뒤 값으로 채워서 봐요.")
+    else:
+        add("빈칸", "좋음", f"분석 열의 빈칸 비율 최대 {worst[1]:.1%}")
+
+    # 잡힌 비율
+    rows = out["result"]["rows"]
+    flagged = sum(1 for r in rows if r["flagged"])
+    ratio = flagged / max(1, len(rows))
+    if mode == "timeseries":
+        n_ev = len(out["result"]["events"])
+        per1k = 1000 * n_ev / max(1, len(rows))
+        detail = f"이벤트 {n_ev:,}건(1,000행당 {per1k:.1f}건), 이상으로 표시된 행 {flagged:,}개({ratio:.1%})"
+        too_many = per1k > 10 or ratio > 0.5   # 이벤트는 여러 행에 걸치므로 행 비율보다 이벤트 수로 봄
+    else:
+        detail = f"확인이 필요한 행 {flagged:,}개({ratio:.1%})"
+        too_many = ratio > 0.05
+    if too_many:
+        add("잡힌 양", "주의", detail + "로 많은 편이에요.",
+            "정상 데이터에서도 많이 잡히면 결과를 믿기 어려워요. '기준값 k' 탭에서 k를 키운 결과를 보세요.")
+    else:
+        add("잡힌 양", "좋음", detail)
+
+    # 기준 구간 대표성(시계열): 앞 30%와 나머지의 수준 차이
+    if mode == "timeseries":
+        nb = out["base"]["nb"]
+        moved = []
+        for c in out["prep"]["cols"]:
+            rest = np.array(c["filled"][nb:], dtype=float)
+            if len(rest) and c["sigma"] > 0:
+                shift = abs(np.nanmedian(rest) - c["mu"]) / c["sigma"]
+                if shift >= 2:
+                    moved.append(f"{c['name']}({shift:.1f}σ)")
+        if moved:
+            add("기준 구간", "주의", f"엔진은 앞쪽 {nb:,}행을 정상 기준으로 삼는데, 나머지 구간의 수준이 크게 달라요: " + ", ".join(moved),
+                "앞부분이 정상 운전이 아니면 이벤트가 많이 나와요. 정상 구간이 앞에 오도록 파일을 자르세요.")
+        else:
+            add("기준 구간", "좋음", f"앞쪽 {nb:,}행을 정상 기준으로 삼았고, 나머지 구간과 수준 차이가 크지 않아요.")
+
+    if n < 100:
+        add("행 수", "주의", f"{n}행뿐이라 판정이 흔들릴 수 있어요.", "가능하면 수백 행 이상을 넣으세요.")
+    if res["seconds"] > 20:
+        add("실행 시간", "주의", f"한 번 분석에 {res['seconds']}초 걸렸어요.", f"{BIG_ROWS:,}행이 넘으면 필요한 기간·열만 잘라서 넣는 게 좋아요.")
+    else:
+        add("실행 시간", "좋음", f"한 번 분석에 {res['seconds']}초")
+    return items
+
+
+# ================================================================ 2-2. 이상 심기 240회 (내 파일의 실제 값 위에)
+def _overlap(a, b):
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
+def _robust_sigma(y):
+    y = np.asarray(y, dtype=float)
+    y = y[np.isfinite(y)]
+    if not len(y):
+        return 1.0
+    s = 1.4826 * np.median(np.abs(y - np.median(y)))
+    if not s > 0:
+        s = np.std(y, ddof=1) if len(y) > 1 else 0.0
+    return float(s) if s > 0 else max(abs(float(np.median(y))) * 1e-3, 1e-6)
+
+
+def _ts_segments(df, k):
+    o = run_engine(df, columns=list(df.columns), mode="timeseries", k=k)
+    rn = o["prep"]["rowNums"]
+    return [(rn[e["start"]] - 2, rn[e["end"]] - 2) for e in o["result"]["events"]]
+
+
+def ts_window(out):
+    """정상 기준이 오염되지 않게, 이상 표시가 가장 적은 연속 구간을 실험 창으로 고름"""
+    prep = out["prep"]
+    n = len(prep["idx"])
+    N = min(n, TS_WINDOW)
+    flags = np.array([1 if r["flagged"] else 0 for r in out["result"]["rows"]], dtype=float)
+    start = 0
+    if n > N:
+        sums = np.convolve(flags, np.ones(N), mode="valid")
+        start = int(np.argmin(sums))
+    cols = {c["name"]: np.asarray(c["filled"][start:start + N], dtype=float) for c in prep["cols"]}
+    return start, pd.DataFrame(cols)
+
+
+def _inject_ts(y, kind, size, sigma, s, L, rng):
+    y = y.copy()
+    sign = rng.choice([-1, 1])
+    if kind == "튀는 값":
+        y[s] += sign * size * sigma
+    elif kind == "수준 이동":
+        y[s:s + L] += sign * size * sigma
+    elif kind == "변동성 증가":
+        y[s:s + L] += rng.normal(0, size * sigma, L)
+    else:
+        y[s:s + L] += sign * np.linspace(0, size * sigma, L)
+    return y
+
+
+def ts_trials(win, target, k, kinds, sizes, reps):
+    """시계열: 실험 창의 대상 열에 이상을 하나씩 심고 엔진을 다시 돌려 잡는지 봄"""
+    N = len(win)
+    base_ev = _ts_segments(win, k)
+    sigma = _robust_sigma(win[target].values)
+    L_long = max(5, min(40, N // 10))
+    recs = []
+    for ki, kind in enumerate(kinds):
+        L = 1 if kind == "튀는 값" else L_long
+        for si, size in enumerate(sizes):
+            for rep in range(reps):
+                rng = np.random.default_rng(10000 * ki + 100 * si + rep)
+                lo, hi = int(N * 0.35), N - L - 1
+                s = int(rng.integers(lo, hi)) if hi > lo else lo
+                for _ in range(50):   # 원래 있던 이벤트와 겹치지 않는 자리에 심음
+                    if not any(_overlap((s, s + L - 1), b) for b in base_ev):
+                        break
+                    s = int(rng.integers(lo, hi)) if hi > lo else lo
+                df = win.copy()
+                df[target] = _inject_ts(win[target].values, kind, size, sigma, s, L, rng)
+                ev = _ts_segments(df, k)
+                seg = (s, s + L - 1)
+                hits = [e for e in ev if _overlap(e, seg)]
+                fp = sum(1 for e in ev if not _overlap(e, seg) and not any(_overlap(e, b) for b in base_ev))
+                recs.append({"종류": kind, "크기": size, "반복": rep, "시작": s, "길이": L, "잡음": bool(hits), "오탐": fp,
+                             "지연": (min(e[0] for e in hits) - s) if hits else None, "잡은 구간": ev,
+                             "y": df[target].values if rep == 0 else None})   # 첫 번째 반복만 그래프용으로 보관
+    return recs, base_ev, sigma
+
+
+def table_sample(out):
+    prep = out["prep"]
+    n = len(prep["idx"])
+    pick = np.sort(np.random.default_rng(0).choice(n, size=min(n, TABLE_SAMPLE), replace=False))
+    data = {c["name"]: np.asarray(c["values"], dtype=float)[pick] for c in prep["cols"]}
+    return pd.DataFrame(data)
+
+
+def _table_flags(df, k):
+    o = run_engine(df, columns=list(df.columns), mode="table", k=k)
+    return {r["i"] for r in o["result"]["outliers"]}
+
+
+def table_trials(sample, target, k, kinds, sizes_of, reps):
+    """표: 표본의 대상 열에서 한 행의 값을 극단값·자릿수 실수로 바꾸고 엔진이 그 행을 잡는지 봄"""
+    base = _table_flags(sample, k)
+    y = sample[target].values
+    fin = y[np.isfinite(y)]
+    med, sigma, nonneg = float(np.median(fin)), _robust_sigma(fin), bool(len(fin) and fin.min() >= 0)
+    ok_rows = [i for i in range(len(y)) if np.isfinite(y[i]) and i not in base]
+    recs = []
+    for ki, kind in enumerate(kinds):
+        for si, size in enumerate(sizes_of[kind]):
+            if kind == "낮은 쪽 극단값" and nonneg and med - size * sigma < 0:
+                recs += [{"종류": kind, "크기": size, "반복": r, "해당 없음": True} for r in range(reps)]
+                continue
+            for rep in range(reps):
+                rng = np.random.default_rng(10000 * ki + 100 * si + rep)
+                rows = [i for i in ok_rows if y[i] != 0] if kind == "자릿수 실수" else ok_rows
+                if not rows:
+                    recs.append({"종류": kind, "크기": size, "반복": rep, "해당 없음": True})
+                    continue
+                i = int(rng.choice(rows))
+                new = y.copy()
+                if kind == "높은 쪽 극단값":
+                    new[i] = med + size * sigma
+                elif kind == "낮은 쪽 극단값":
+                    new[i] = med - size * sigma
+                else:
+                    f = {"×10": 10, "×100": 100, "÷10": 0.1, "÷100": 0.01}[size]
+                    new[i] = y[i] * f
+                df = sample.copy()
+                df[target] = new
+                flags = _table_flags(df, k)
+                recs.append({"종류": kind, "크기": size, "반복": rep, "행": i, "원래 값": float(y[i]), "바꾼 값": float(new[i]),
+                             "잡음": i in flags, "오탐": len(flags - base - {i}), "해당 없음": False})
+    return recs, base, sigma
+
+
+@st.cache_resource(max_entries=4, show_spinner=False)
+def run_trials(data, mode, k, columns, name, target):
+    out = analyze_file(data, mode, k, columns, name)["out"]
+    t0 = time.time()
+    if out["mode"] == "timeseries":
+        start, win = ts_window(out)
+        recs, base_ev, sigma = ts_trials(win, target, k, TS_KINDS, TS_SIZES, REPS)
+        info = {"창 시작 행": start, "창 길이": len(win), "원래 이벤트": len(base_ev), "σ": sigma}
+        return {"mode": "timeseries", "recs": recs, "win": win, "base": base_ev, "info": info, "seconds": round(time.time() - t0, 1)}
+    sample = table_sample(out)
+    recs, base, sigma = table_trials(sample, target, k, TABLE_KINDS, TABLE_SIZES, REPS)
+    info = {"표본 행": len(sample), "원래 이상치": len(base), "σ": sigma}
+    return {"mode": "table", "recs": recs, "win": sample, "base": base, "info": info, "seconds": round(time.time() - t0, 1)}
+
+
+def trial_scores(recs):
+    done = [r for r in recs if not r.get("해당 없음")]
+    tp = sum(r["잡음"] for r in done)
+    fp = sum(r["오탐"] for r in done)
+    big = [r for r in done if (isinstance(r["크기"], (int, float)) and r["크기"] >= 4) or isinstance(r["크기"], str)]
+    rec = tp / len(done) if done else 0.0
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    return {"실험_수": len(done), "재현율": round(rec, 3), "정밀도": round(prec, 3),
+            "F1": round(2 * rec * prec / (rec + prec), 3) if rec + prec else 0.0,
+            "큰_이상_재현율": round(sum(r["잡음"] for r in big) / len(big), 3) if big else 0.0, "오탐_합계": fp}
+
+
+def trial_grid(recs):
+    rows = []
+    for kind in dict.fromkeys(r["종류"] for r in recs):
+        for size in dict.fromkeys(r["크기"] for r in recs if r["종류"] == kind):
+            cell = [r for r in recs if r["종류"] == kind and r["크기"] == size]
+            done = [r for r in cell if not r.get("해당 없음")]
+            if not done:
+                rows.append({"이상 종류": kind, "크기": f"{size}σ" if isinstance(size, (int, float)) else size,
+                             "재현율(%)": None, "실험 수": 0, "평균 오탐": None, "평균 지연(행)": None, "비고": "음수가 돼서 해당 없음"})
+                continue
+            delays = [r["지연"] for r in done if r.get("지연") is not None]
+            rows.append({"이상 종류": kind, "크기": f"{size}σ" if isinstance(size, (int, float)) else size,
+                         "재현율(%)": round(100 * sum(r["잡음"] for r in done) / len(done)),
+                         "실험 수": len(done), "평균 오탐": round(float(np.mean([r["오탐"] for r in done])), 2),
+                         "평균 지연(행)": round(float(np.median(delays)), 1) if delays else None, "비고": ""})
+    return rows
+
+
+# ================================================================ 2-3. 기준값 k
+@st.cache_resource(max_entries=4, show_spinner=False)
+def run_k_sweep(data, mode, k, columns, name, target):
+    """k마다: 심은 이상(크기 4)을 몇 개 잡나 + 실험 구간 원래 데이터에서 몇 개 표시되나"""
+    out = analyze_file(data, mode, k, columns, name)["out"]
+    pts = []
+    if out["mode"] == "timeseries":
+        _, win = ts_window(out)
+        for kk in K_GRID:
+            recs, base_ev, _ = ts_trials(win, target, kk, TS_KINDS, [4], 5)
+            sc = trial_scores(recs)
+            pts.append({"k": kk, "재현율": sc["재현율"], "정밀도": sc["정밀도"], "F1": sc["F1"], "원래 데이터 표시 수": len(base_ev)})
+    else:
+        sample = table_sample(out)
+        sizes = {"높은 쪽 극단값": [4], "자릿수 실수": ["×10"]}
+        for kk in K_GRID:
+            recs, base, _ = table_trials(sample, target, kk, list(sizes), sizes, 10)
+            sc = trial_scores(recs)
+            pts.append({"k": kk, "재현율": sc["재현율"], "정밀도": sc["정밀도"], "F1": sc["F1"], "원래 데이터 표시 수": len(base)})
+    best = max(pts, key=lambda p: (p["F1"], -abs(p["k"] - 1.0)))
+    return pts, best
+
+
+# ================================================================ 2-4. robust Z 손 재현
+def robust_check(out):
+    """엔진이 낸 중앙값·퍼짐·Z를 numpy로 따로 계산해서 맞춰 봄"""
+    rows, examples = [], []
+    if out["mode"] == "table":
+        for c in out["prep"]["cols"]:
+            v = np.asarray(c["values"], dtype=float)
+            fin = v[np.isfinite(v)]
+            if c.get("discrete"):
+                rows.append({"열": c["name"], "척도": "-", "손 계산 중앙값": None, "엔진 중앙값": None, "손 계산 σ": None,
+                             "엔진 σ": None, "Z 최대 차이": None, "일치": "건너뜀(절반 넘게 같은 값 · 엔진도 Z를 안 씀)"})
+                continue
+            log = c.get("scale") == "log"
+            shift = 0.0 if (not log or fin.min() > 0) else 1.0
+            t = np.log(v + shift) if log else v
+            m = float(np.nanmedian(t))
+            s = 1.4826 * float(np.nanmedian(np.abs(t - m)))
+            if not s > 0:
+                s = float(np.nanstd(t, ddof=1))
+            z_hand = (t - m) / s
+            z_eng = np.asarray(c["z"], dtype=float)
+            diff = float(np.nanmax(np.abs(z_hand - z_eng))) if np.isfinite(z_eng).any() else float("nan")
+            mu_hand = math.exp(m) - shift if log else m
+            ok = diff < 1e-6 and abs(mu_hand - c["mu"]) < 1e-6 * max(1, abs(c["mu"])) and abs(s - c["sigma"]) < 1e-6 * max(1, s)
+            rows.append({"열": c["name"], "척도": "로그" if log else "원래", "손 계산 중앙값": round(mu_hand, 4), "엔진 중앙값": round(c["mu"], 4),
+                         "손 계산 σ": round(s, 4), "엔진 σ": round(c["sigma"], 4), "Z 최대 차이": diff, "일치": "일치" if ok else "다름"})
+        cols = out["prep"]["cols"]
+        for r in out["result"]["outliers"][:5]:
+            for j in r["cause"][:1]:
+                c = cols[j]
+                if c.get("discrete") or not math.isfinite(c["values"][r["i"]]):
+                    continue
+                examples.append({"원래 행": out["prep"]["rowNums"][r["i"]], "열": c["name"], "값": c["values"][r["i"]],
+                                 "척도": "로그" if c.get("scale") == "log" else "원래", "엔진 Z": round(c["z"][r["i"]], 3)})
+    else:
+        nb = out["base"]["nb"]
+        for c in out["prep"]["cols"]:
+            x = np.asarray(c["filled"][:nb], dtype=float)
+            m = float(np.nanmedian(x))
+            s = 1.4826 * float(np.nanmedian(np.abs(x - m)))
+            if not s > 0:
+                s = float(np.nanstd(x, ddof=1))
+            ok = abs(m - c["mu"]) < 1e-6 * max(1, abs(m)) and abs(s - c["sigma"]) < 1e-6 * max(1, s)
+            rows.append({"열": c["name"], "척도": f"앞 {nb}행", "손 계산 중앙값": round(m, 4), "엔진 중앙값": round(c["mu"], 4),
+                         "손 계산 σ": round(s, 4), "엔진 σ": round(c["sigma"], 4),
+                         "정상범위(손)": f"{m - 3 * s:.2f} ~ {m + 3 * s:.2f}", "정상범위(엔진)": f"{c['band'][0]:.2f} ~ {c['band'][1]:.2f}",
+                         "일치": "일치" if ok else "다름"})
+        for e in out["result"]["events"][:5]:
+            c = out["prep"]["cols"][e["main"]]
+            examples.append({"이벤트": e["id"], "열": c["name"], "가장 벗어난 값": e["peakVal"],
+                             "손 계산 Z": round((e["peakVal"] - c["mu"]) / c["sigma"], 2)})
+    return rows, examples
+
+
+# ================================================================ 2-5. 숫자 검증기 (내 파일의 기본 리포트로)
+NUM_RE = re.compile(r"(?<![\w.])(\d+\.\d+|\d{2,})(?![\w.])")
+
+
+def verifier_check(out):
+    base = report_text(out)
+    s_text = json.dumps(out["summary"], ensure_ascii=False)
+    clean = verify_numbers(base, s_text)
+    cases = []
+    for m in list(NUM_RE.finditer(base))[:40]:
+        v = float(m.group(1))
+        wrong = round(v * 1.37 + 1, 2)
+        tampered = base[:m.start(1)] + str(wrong) + base[m.end(1):]
+        caught = bool(verify_numbers(tampered, s_text)["bad"])
+        cases.append({"원래 숫자": m.group(1), "바꾼 숫자": str(wrong), "잡음": caught,
+                      "앞뒤 글": base[max(0, m.start(1) - 18):m.end(1) + 10].replace("\n", " ")})
+    return {"clean": clean, "cases": cases, "report": base}
+
+
+# ================================================================ 3. 종합 판정
+def fitness_summary(res, diag, trials, kpts, kbest, rz_rows, ver, k):
+    out = res["out"]
+    sc = trial_scores(trials["recs"])
+    grid, fpgrid = {}, {}
+    for row in trial_grid(trials["recs"]):
+        if row["재현율(%)"] is not None:
+            grid.setdefault(row["이상 종류"], {})[row["크기"]] = row["재현율(%)"]
+            fpgrid.setdefault(row["이상 종류"], {})[row["크기"]] = row["평균 오탐"]
+    compared = [r for r in rz_rows if r["일치"] in ("일치", "다름")]
+    caught = sum(c["잡음"] for c in ver["cases"])
+    return {
+        "파일": {"행": out["profile"]["n"], "열": len(res["table"]["columns"]), "모드": "시계열" if out["mode"] == "timeseries" else "표",
+               "분석_열": out["columns"], "실행_초": res["seconds"]},
+        "데이터_진단": [{"항목": d["항목"], "상태": d["상태"], "내용": d["내용"], "권장": d["권장"]} for d in diag],
+        "이상_심기": {"대상_열": trials["target"], "실험_수": sc["실험_수"], "재현율_퍼센트": round(100 * sc["재현율"], 1),
+                  "큰_이상_재현율_퍼센트": round(100 * sc["큰_이상_재현율"], 1), "정밀도_퍼센트": round(100 * sc["정밀도"], 1),
+                  "종류별_크기별_재현율_퍼센트": grid, "종류별_크기별_평균_새_오탐": fpgrid},
+        "기준값_k": {"지금_k": k, "F1이_가장_높은_k": kbest["k"], "그때_F1": kbest["F1"],
+                  "k별": [{"k": p["k"], "재현율": p["재현율"], "정밀도": p["정밀도"], "원래_데이터_표시_수": p["원래 데이터 표시 수"]} for p in kpts]},
+        "robust_Z_대조": {"비교한_열": len(compared), "일치한_열": sum(r["일치"] == "일치" for r in compared)},
+        "숫자_검증기": {"바꾼_숫자": len(ver["cases"]), "잡은_수": caught, "깨끗한_리포트에서_틀렸다고_한_숫자": len(ver["clean"]["bad"])},
+    }
+
+
+def grade_of(S):
+    probs = [d for d in S["데이터_진단"] if d["상태"] == "문제"]
+    warns = [d for d in S["데이터_진단"] if d["상태"] == "주의"]
+    big = S["이상_심기"]["큰_이상_재현율_퍼센트"]
+    rz_bad = S["robust_Z_대조"]["비교한_열"] - S["robust_Z_대조"]["일치한_열"]
+    if probs or big < 50 or rz_bad:
+        return "맞지 않음", probs, warns
+    if warns or big < 80 or S["이상_심기"]["정밀도_퍼센트"] < 70:
+        return "주의 필요", probs, warns
+    return "잘 맞음", probs, warns
+
+
+GRADE_SENTENCE = {"잘 맞음": "공용 엔진과 잘 맞아요. 결과를 그대로 참고해도 돼요.",
+                  "주의 필요": "공용 엔진으로 돌릴 수 있지만, 아래 '주의할 것'을 감안해서 결과를 읽어야 해요.",
+                  "맞지 않음": "이대로는 공용 엔진 결과를 믿기 어려워요. 아래 '권장 설정'대로 고친 뒤 다시 돌려 보세요."}
+
+
+def verdict_text(S):
+    """AI 없이 점검 요약에서 바로 만드는 기본 판정"""
+    g, probs, warns = grade_of(S)
+    T, F, K = S["이상_심기"], S["파일"], S["기준값_k"]
+    lines = ["## 한 줄 판정", f"- **{g}** — 이 파일은 {GRADE_SENTENCE[g]}",
+             f"- {F['행']:,}행 · {F['모드']} 모드 · 분석 열 {len(F['분석_열'])}개({', '.join(F['분석_열'])})", ""]
+    lines += ["## 잘 되는 것"]
+    good = [d for d in S["데이터_진단"] if d["상태"] == "좋음"]
+    lines += [f"- 크기가 큰(4σ 이상·자릿수 실수) 심은 이상을 {T['큰_이상_재현율_퍼센트']}% 잡았어요. 전체 {T['실험_수']}회 중 재현율 {T['재현율_퍼센트']}%, 정밀도 {T['정밀도_퍼센트']}%예요."]
+    best = [(kind, size, v) for kind, d in T["종류별_크기별_재현율_퍼센트"].items() for size, v in d.items()]
+    strong = [f"{kind} {size}" for kind, size, v in best if v >= 90]
+    weak = [f"{kind} {size}({v}%)" for kind, size, v in best if v < 50 and (size.endswith("σ") and float(size[:-1]) >= 4)]
+    if strong:
+        lines.append("- 거의 다 잡는 경우: " + ", ".join(strong[:6]))
+    rz = S["robust_Z_대조"]
+    lines.append(f"- robust Z를 손으로 다시 계산해 보니 {rz['비교한_열']}개 열 중 {rz['일치한_열']}개가 엔진과 일치했어요.")
+    lines += [f"- {d['항목']}: {d['내용']}" for d in good if d["항목"] in ("모드와 데이터 모양", "이름표 같은 숫자 열", "기준 구간")]
+    noisy = [f"{kind} {size}(평균 {v}개)" for kind, d in T["종류별_크기별_평균_새_오탐"].items() for size, v in d.items() if v and v >= 1]
+    lines += ["", "## 주의할 것"]
+    if not probs and not warns and not weak and not noisy:
+        lines.append("- 특별히 주의할 점이 보이지 않았어요.")
+    lines += [f"- **{d['항목']}** ({d['상태']}): {d['내용']}" for d in probs + warns]
+    if weak:
+        lines.append("- 크기가 커도 잘 못 잡는 경우: " + ", ".join(weak))
+    if noisy:
+        lines.append("- 이런 값이 하나 들어가면 다른 정상 행까지 새로 표시돼요: " + ", ".join(noisy[:6])
+                     + ". 값 하나 때문에 열 전체의 판정 기준(척도)이 바뀐 경우예요.")
+    lines += ["", "## 권장 설정"]
+    if K["F1이_가장_높은_k"] != K["지금_k"]:
+        lines.append(f"- 이 파일에서는 k = {K['F1이_가장_높은_k']}일 때 F1이 가장 높았어요(F1 {K['그때_F1']}, 지금 k = {K['지금_k']}).")
+    else:
+        lines.append(f"- 지금 k = {K['지금_k']}일 때 이 파일에서 F1이 가장 높았어요(F1 {K['그때_F1']}).")
+    advice = [d for d in S["데이터_진단"] if d["상태"] != "좋음" and d.get("권장")]
+    lines += [f"- {d['권장']}" for d in advice]
+    lines += ["", "## 한계",
+              "- 이 판정은 파일의 실제 값 위에 이상을 심어 본 실험과 계산 대조에 근거해요. 파일에 원래 있던 이상의 원인은 알려 주지 않아요.",
+              "- 심은 이상과 실제로 생기는 이상의 모양이 다를 수 있어요."]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- AI 호출 (비용 장치 포함)
 def ai_settings():
     """Secrets에서 키와 모델을 읽어요. secrets.toml이 없으면 st.secrets 접근 자체가 오류라 감싸요."""
     try:
@@ -57,36 +556,71 @@ def ai_settings():
         return None, AI_DEFAULT_MODEL
 
 
+@st.cache_resource
+def global_counter():
+    """모든 접속이 함께 쓰는 호출 카운터. 앱이 다시 시작되거나 날짜가 바뀌면 0부터 다시 세요."""
+    return {"lock": threading.Lock(), "day": None, "used": 0}
+
+
+def _take_global_call():
+    g = global_counter()
+    with g["lock"]:
+        today = datetime.date.today().isoformat()
+        if g["day"] != today:
+            g["day"], g["used"] = today, 0
+        if g["used"] >= AI_GLOBAL_LIMIT:
+            return False
+        g["used"] += 1
+        return True
+
+
+def _give_back_global_call():
+    g = global_counter()
+    with g["lock"]:
+        g["used"] = max(0, g["used"] - 1)
+
+
 def claude_writer(key, model):
-    """AI 호출 함수를 만들어 돌려줘요. 부를 때마다 세션 호출 수를 세고, 상한을 넘으면 멈춰요."""
+    """AI 호출 함수. 접속당 상한과 앱 전체 하루 상한을 지키고, 돈이 들지 않은 실패 호출은 횟수를 돌려줘요."""
     def write(messages):
         used = st.session_state.get("ai_calls", 0)
         if used >= AI_CALL_LIMIT:
-            raise RuntimeError(f"이 접속에서 AI 호출 {AI_CALL_LIMIT}번을 모두 썼어요. 새로 접속하면 다시 쓸 수 있어요.")
+            raise RuntimeError(f"이 접속에서 AI 호출 {AI_CALL_LIMIT}번을 모두 썼어요.")
+        if not _take_global_call():
+            raise RuntimeError(f"오늘 앱 전체 AI 호출 {AI_GLOBAL_LIMIT}번을 모두 썼어요. 내일 다시 쓸 수 있어요.")
         st.session_state["ai_calls"] = used + 1
-        body = json.dumps({"model": model, "max_tokens": 1500, "system": AI_SYSTEM, "messages": messages}).encode("utf-8")
+
+        def give_back():
+            st.session_state["ai_calls"] = max(0, st.session_state.get("ai_calls", 1) - 1)
+            _give_back_global_call()
+
+        body = json.dumps({"model": model, "max_tokens": AI_MAX_TOKENS, "system": AI_SYSTEM, "messages": messages}).encode("utf-8")
         req = urllib.request.Request(AI_URL, data=body, headers={
             "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                give_back()
             raise RuntimeError(f"AI 호출 실패 (HTTP {e.code}): {e.read().decode('utf-8', 'ignore')[:200]}") from e
         except urllib.error.URLError as e:
+            give_back()
             raise RuntimeError(f"AI 서버에 연결하지 못했어요: {e.reason}") from e
+        if data.get("stop_reason") == "max_tokens":
+            raise RuntimeError("AI 리포트가 길이 제한에 걸려 중간에 잘렸어요.")
         return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     return write
 
 
 def fake_writer(base_report, summary):
-    """API 키 없이 흐름을 시험하는 가짜 AI: 첫 번째엔 숫자 하나를 틀리게 쓰고, 고쳐 달라고 하면 바르게 써요.
-    틀린 숫자가 우연히 다른 계산값과 비슷해 검증을 통과하지 않도록, 검증기가 잡는 값으로 골라요."""
+    """API 키 없이 흐름을 시험하는 가짜 AI: 첫 번째엔 숫자 하나를 틀리게 쓰고, 고쳐 달라고 하면 바르게 써요."""
     summary_text = json.dumps(summary, ensure_ascii=False)
 
     def write(messages):
-        if len(messages) > 1:   # 고쳐 달라는 요청이 붙어 있으면 바른 리포트
+        if len(messages) > 1:
             return base_report
-        for m in re.finditer(r"(?<![\w.])(\d+\.\d+|\d{2,})(?![\w.])", base_report):
+        for m in NUM_RE.finditer(base_report):
             for factor in (1.1, 1.37, 2.9, 7.3):
                 wrong = round(float(m.group(1)) * factor + 1, 2)
                 candidate = base_report[:m.start(1)] + str(wrong) + base_report[m.end(1):]
@@ -112,237 +646,254 @@ def write_verified_report(summary, writer, max_retries=AI_MAX_RETRIES):
     return {"report": report, "check": check, "attempts": attempts, "passed": not check["bad"]}
 
 
+def report_key(summary, writer_name):
+    return hashlib.sha256((writer_name + json.dumps(summary, ensure_ascii=False, sort_keys=True)).encode("utf-8")).hexdigest()
+
+
 def cached_report(summary, writer_name, writer):
     """같은 요약 + 같은 작성자면 저장해 둔 결과를 재사용해요(호출 수 절약)."""
-    key = hashlib.sha256((writer_name + json.dumps(summary, ensure_ascii=False, sort_keys=True)).encode("utf-8")).hexdigest()
+    key = report_key(summary, writer_name)
     cache = st.session_state.setdefault("ai_cache", {})
     if key not in cache:
         cache[key] = write_verified_report(summary, writer)
     return cache[key]
 
 
-def robust_z(values, base_n):
-    base = values[:base_n]
-    m = np.median(base)
-    s = 1.4826 * np.median(np.abs(base - m))
-    return m, s, (values - m) / (s if s > 0 else 1)
-
-
-def segments(mask, min_len):
-    out, start = [], None
-    for i, on in enumerate(list(mask) + [False]):
-        if on and start is None:
-            start = i
-        if not on and start is not None:
-            if i - start >= min_len:
-                out.append((start, i - 1))
-            start = None
-    return out
-
-
-def engine_segments(y, k):
-    """공용 엔진을 시계열 모드로 돌려 (시작 행, 끝 행) 목록을 돌려줘요.
-    시간 열이 없는 데이터라 mode를 지정하지 않으면 표 모드가 되어 이벤트가 0건이 돼요."""
-    out = run_engine(pd.DataFrame({"값": y}), mode="timeseries", k=k)
-    rn = out["prep"]["rowNums"]  # CSV 줄 번호(머리글이 1번) → 0부터 세는 행 번호는 -2
-    return out, [(rn[e["start"]] - 2, rn[e["end"]] - 2) for e in out["result"]["events"]]
-
+# ================================================================ 화면
+STATUS_ICON = {"좋음": "✅ 좋음", "주의": "⚠️ 주의", "문제": "❌ 문제"}
 
 st.caption("엔진 실험실 · 담당: 수학과 B")
-st.title("이 엔진을 어디까지 믿을 수 있나")
-big = L["bench"]["big"]
-a, b, c, d = st.columns(4)
-a.metric("240회 재현율", f"{L['bench']['recall']:.1%}")
-b.metric("정밀도", f"{L['bench']['precision']:.1%}")
-c.metric("4σ 이상 F1", f"{big['f1']:.2f}")
-d.metric("숫자 검증기 재현율", f"{L['verifier']['numRecall']:.1%}")
+st.title("내 파일, 이 엔진으로 믿고 돌려도 될까?")
+st.write("CSV를 올리면 공용 엔진으로 분석하고, 그 파일의 실제 값으로 엔진이 제대로 작동하는지 탭마다 점검해요. "
+         "맨 아래에서 종합 판정을 읽을 수 있어요.")
 
-t_inject, t_csv, t_bench, t_k, t_ver, t_rob, t_ai = st.tabs(
-    ["이상 심어 보기", "내 CSV로 돌려 보기", "240회 실험", "기준값 k", "숫자 검증기", "robust Z 손 재현", "AI 전송 설계"])
+# ---------------------------------------------------------------- 1. 파일 입력
+st.header("① 파일 넣기")
+src = st.radio("파일", ["내 CSV 올리기", "예시 파일로 해 보기"], horizontal=True, label_visibility="collapsed")
+data, fname = None, ""
+if src == "내 CSV 올리기":
+    up = st.file_uploader("CSV 파일 (UTF-8·CP949 모두 돼요)", type=["csv"])
+    if up is not None:
+        data, fname = up.getvalue(), up.name
+else:
+    pick = st.selectbox("예시 파일", list(SAMPLES))
+    p = ROOT / "tests" / "fixtures" / SAMPLES[pick]
+    if p.exists():
+        data, fname = p.read_bytes(), p.name
+    else:
+        st.error("예시 파일을 찾지 못했어요.")
+
+if data is None:
+    st.info("CSV를 올리면 분석이 시작돼요. 센서처럼 시간 순서가 있는 데이터도, 한 행이 한 사람·한 건인 표도 돼요.")
+    st.stop()
+
+try:
+    with st.spinner("파일을 읽는 중이에요…"):
+        table0, prof0 = file_profile(data)
+except ValueError as e:
+    st.error(str(e))
+    st.stop()
+
+n_rows = prof0["n"]
+if n_rows > BIG_ROWS:
+    st.warning(f"{n_rows:,}행짜리 큰 파일이에요. 처음 분석은 수십 초 걸릴 수 있어요(같은 설정으로 다시 볼 때는 바로 떠요).")
+
+c1, c2, c3 = st.columns([2, 1, 3])
+mode_ko = {"자동": "auto", "시계열 (행 순서 = 시간)": "timeseries", "표 (한 행 = 한 건)": "table"}
+mode_label = c1.radio("모드", list(mode_ko), horizontal=True,
+                      help="자동: 시간 열이 있으면 시계열, 없으면 표. 시간 열 없이 행 순서가 시간인 센서 데이터는 '시계열'을 고르세요.")
+k = c2.select_slider("민감도 k (크면 덜 민감)", options=K_GRID, value=1.0)
+cols_pick = c3.multiselect("분석할 열 (비워 두면 엔진이 골라요)", numeric_options(prof0),
+                           help="코드·번호처럼 숫자 크기에 뜻이 없는 열은 빼세요.")
+mode = mode_ko[mode_label]
+cols_key = tuple(cols_pick)
+
+try:
+    with st.spinner(f"공용 엔진으로 {n_rows:,}행을 분석하는 중이에요…"):
+        res = analyze_file(data, mode, k, cols_key, fname)
+except ValueError as e:
+    st.error(str(e))
+    st.stop()
+out = res["out"]
+diag = diagnose(res, mode)
+
+target = st.selectbox("이상 심기 실험에 쓸 열", out["columns"],
+                      help="이 열의 실제 값 위에 이상을 하나씩 심고 엔진이 잡는지 최대 240번 봐요(음수가 되는 실험은 빼요).")
+with st.spinner("이상을 240번 심어 보고, 기준값 k를 바꿔 보는 중이에요… (큰 파일이면 30초쯤)"):
+    trials = run_trials(data, mode, k, cols_key, fname, target)
+    trials = dict(trials, target=target)
+    kpts, kbest = run_k_sweep(data, mode, k, cols_key, fname, target)
+rz_rows, rz_examples = robust_check(out)
+ver = verifier_check(out)
+S = fitness_summary(res, diag, trials, kpts, kbest, rz_rows, ver, k)
+grade, _, _ = grade_of(S)
+sc = trial_scores(trials["recs"])
+
+# ---------------------------------------------------------------- 요약 지표
+a, b, c, d = st.columns(4)
+a.metric("종합 판정", grade)
+b.metric("실제로 돈 모드", "시계열" if out["mode"] == "timeseries" else "표", f"분석 열 {len(out['columns'])}개", delta_color="off")
+c.metric("큰 이상 재현율", f"{sc['큰_이상_재현율']:.0%}", f"{sc['실험_수']}회 전체 {sc['재현율']:.0%}", delta_color="off",
+         help="4σ 이상(표 모드는 자릿수 실수 포함)으로 심은 이상 중 엔진이 잡은 비율")
+d.metric("진단 경고", f"{sum(x['상태'] != '좋음' for x in diag)}개", f"항목 {len(diag)}개 중", delta_color="off")
+
+# ---------------------------------------------------------------- 2. 탭별 점검
+st.header("② 점검 결과")
+t_run, t_diag, t_inject, t_k, t_rob, t_ver = st.tabs(
+    ["기본 실행 결과", "데이터 진단", "이상 심기 240회", "기준값 k", "robust Z 대조", "숫자 검증기"])
+
+with t_run:
+    st.caption(f"{out['notice']} · 분석 열: {', '.join(out['columns'])} · {res['seconds']}초")
+    if mode == "auto" and out["mode"] == "table":
+        st.info("시간 열을 찾지 못해 표 모드로 돌았어요. 센서처럼 행 순서가 시간인 데이터라면 위에서 '시계열'을 고르세요.")
+    nres = len(out["result"]["events"]) if out["mode"] == "timeseries" else len(out["result"]["outliers"])
+    st.markdown(f"**{'이벤트' if out['mode'] == 'timeseries' else '확인이 필요한 행'} {nres:,}개**")
+    ev_rows = events_table(out)
+    if len(ev_rows) > 500:
+        st.caption(f"이상 점수가 높은 순으로 500개만 보여 줘요(전체 {len(ev_rows):,}개).")
+        ev_rows = sorted(ev_rows, key=lambda r: -r.get("이상 점수", 0))[:500]
+    st.dataframe(pd.DataFrame(ev_rows), width="stretch", hide_index=True)
+    with st.expander("열마다 엔진이 본 역할"):
+        st.dataframe(pd.DataFrame(check_table(out)), width="stretch", hide_index=True)
+    with st.expander("기본 리포트 (AI 없이 엔진 요약에서 바로 만든 글)"):
+        st.markdown(report_text(out))
+
+with t_diag:
+    st.subheader("이 파일이 엔진의 전제와 맞는지")
+    st.dataframe(pd.DataFrame([dict(x, 상태=STATUS_ICON[x["상태"]]) for x in diag]), width="stretch", hide_index=True)
+    st.caption("❌ 문제 = 이대로는 결과를 믿기 어려움 · ⚠️ 주의 = 결과를 읽을 때 감안 · ✅ 좋음")
 
 with t_inject:
-    st.subheader("이상을 하나 심고 탐지기를 돌려요")
-    st.caption("회색 = 심은 구간(정답), 빨강 = 잡은 이벤트 · 겹치면 정답, 안 겹치면 오탐")
-    detector = st.radio("탐지기", ["robust Z 하나 (단순)", "공용 엔진 (시계열 모드)"], horizontal=True)
-    use_engine = detector.startswith("공용")
-    col1, col2, col3, col4 = st.columns(4)
-    kind = col1.selectbox("이상 종류", ["튀는 값", "수준 이동", "변동성 증가", "서서히 흐름"])
-    size = col2.slider("크기(σ)", 1.0, 8.0, 4.0, 0.5)
-    if use_engine:
-        k_val = col3.slider("민감도 k (크면 덜 민감)", 0.5, 3.0, 1.0, 0.1)
+    st.subheader(f"'{target}' 열에 이상을 하나씩 심고 엔진이 잡는지 {sc['실험_수']}번")
+    inf = trials["info"]
+    if trials["mode"] == "timeseries":
+        st.caption(f"실험 창: 정렬된 데이터의 {inf['창 시작 행']:,}번째부터 {inf['창 길이']}행(원래 이벤트가 가장 적은 구간) · "
+                   f"σ = 이 구간의 1.4826×MAD = {inf['σ']:.4g} · 창 안에 원래 있던 이벤트 {inf['원래 이벤트']}건은 오탐에서 빼요 · {trials['seconds']}초")
     else:
-        k_val = col3.slider("기준 |z|", 2.0, 8.0, 4.0, 0.5)
-    seed = col4.number_input("시드", 0, 9999, 42)
-    r = np.random.default_rng(int(seed))
-    n, start, length = 500, 320, 40
-    y = 10 + r.standard_normal(n)
-    if kind == "튀는 값":
-        length = 1
-        y[start] += size
-    elif kind == "수준 이동":
-        y[start: start + length] += size
-    elif kind == "변동성 증가":
-        y[start: start + length] = 10 + (y[start: start + length] - 10) * size
+        st.caption(f"표본 {inf['표본 행']:,}행 · σ = 1.4826×MAD = {inf['σ']:.4g} · 원래 표시되던 행 {inf['원래 이상치']}개는 오탐에서 빼요 · {trials['seconds']}초")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("재현율", f"{sc['재현율']:.0%}", help="심은 이상 중 잡은 비율")
+    m2.metric("큰 이상 재현율", f"{sc['큰_이상_재현율']:.0%}")
+    m3.metric("정밀도", f"{sc['정밀도']:.0%}", help="잡은 것 중 심은 이상의 비율(새로 생긴 오탐 포함)")
+    m4.metric("F1", f"{sc['F1']:.2f}")
+    st.dataframe(pd.DataFrame(trial_grid(trials["recs"])), width="stretch", hide_index=True,
+                 column_config={"재현율(%)": st.column_config.ProgressColumn("재현율", min_value=0, max_value=100, format="%d%%")})
+    if trials["mode"] == "timeseries":
+        st.markdown("**예시 한 번 보기**")
+        kinds = list(dict.fromkeys(r["종류"] for r in trials["recs"]))
+        ex1, ex2 = st.columns(2)
+        ex_kind = ex1.selectbox("이상 종류", kinds)
+        ex_size = ex2.selectbox("크기(σ)", TS_SIZES, index=1)
+        rec = next(r for r in trials["recs"] if r["종류"] == ex_kind and r["크기"] == ex_size and r["반복"] == 0)
+        fig = go.Figure(go.Scatter(y=rec["y"], name=target, line=dict(color=BLUE, width=1.5),
+                                   hovertemplate="창 안 %{x}행<br>%{y:.4g}<extra></extra>"))
+        fig.add_vrect(x0=rec["시작"] - 0.5, x1=rec["시작"] + rec["길이"] - 0.5, fillcolor=GRAY, opacity=0.35, line_width=0)
+        for s_, e_ in rec["잡은 구간"]:
+            fig.add_vrect(x0=s_ - 0.5, x1=e_ + 0.5, fillcolor=ORANGE, opacity=0.3, line_width=0)
+        fig.update_layout(height=300, margin=dict(t=20, b=40), xaxis_title="실험 창 안의 행", showlegend=False)
+        st.plotly_chart(fig, width="stretch")
+        st.caption(f"회색 = 심은 구간(정답), 주황 = 엔진이 잡은 이벤트 · 이 예시: {'잡음' if rec['잡음'] else '놓침'}, 새 오탐 {rec['오탐']}건")
     else:
-        y[start: start + length] += np.linspace(0, size, length)
-    if use_engine:
-        out, events = engine_segments(y, k_val)
-        st.caption(f"엔진 모드: {out['mode']} · 분석 열: {', '.join(out['columns'])} · {out['notice']}")
-    else:
-        _, _, z = robust_z(y, 150)
-        events = segments(np.abs(z) >= k_val, 1 if kind == "튀는 값" else 2)
-    hit = any(s <= start + length - 1 and e >= start for s, e in events)
-    fp = sum(1 for s, e in events if e < start or s > start + length - 1)
-    fig = go.Figure(go.Scatter(y=y, name="값", line=dict(width=1)))
-    fig.add_vrect(x0=start - 0.5, x1=start + length - 0.5, fillcolor="gray", opacity=0.3, line_width=0)
-    for s, e in events:
-        fig.add_vrect(x0=s - 0.5, x1=e + 0.5, fillcolor="crimson", opacity=0.3, line_width=0)
-    fig.update_layout(height=320, xaxis_title="행", margin=dict(t=20))
-    st.plotly_chart(fig, width="stretch")
-    a, b = st.columns(2)
-    a.metric("심은 이상", "잡음" if hit else "놓침")
-    b.metric("오탐", f"{fp}건")
-    if use_engine:
-        with st.expander("모드를 지정하지 않으면? (auto → 표 모드)"):
-            auto = run_engine(pd.DataFrame({"값": y}), k=k_val)
-            st.write(f"자동 모드 결과: **{auto['mode']}** · 이벤트 {len(auto['result'].get('events', []))}건 · "
-                     f"확인이 필요한 행 {len(auto['result'].get('outliers', []))}개")
-            st.caption("이 데이터에는 시간 열이 없어서 자동이면 표 모드가 돼요. 행을 하나씩 따로 보므로 수준 이동·서서히 흐름 같은 '이어진 이상'을 이벤트로 묶지 못해요.")
-
-with t_csv:
-    st.subheader("내 CSV를 공용 엔진에 넣어 보기")
-    st.caption("시간 열이 있으면 자동으로 시계열, 없으면 표 모드예요. 시간 열 없이 행 순서가 시간인 센서 데이터라면 '시계열'을 고르세요.")
-    file = st.file_uploader("CSV 파일", type=["csv"])
-    col1, col2 = st.columns(2)
-    mode_ko = {"자동": "auto", "시계열 (행 순서 = 시간)": "timeseries", "표 (한 행 = 한 건)": "table"}
-    mode_label = col1.radio("모드", list(mode_ko), horizontal=True)
-    k_csv = col2.slider("민감도 k (크면 덜 민감)", 0.5, 3.0, 1.0, 0.1, key="k_csv")
-    if file is not None:
-        try:
-            table = load_csv(file.getvalue())
-            out = run_engine(table, mode=mode_ko[mode_label], k=k_csv, dataset_name=file.name)
-        except ValueError as e:
-            st.error(str(e))
-        else:
-            a, b, c = st.columns(3)
-            a.metric("실제로 돈 모드", "시계열" if out["mode"] == "timeseries" else "표")
-            b.metric("분석한 열", len(out["columns"]))
-            c.metric("이벤트" if out["mode"] == "timeseries" else "확인이 필요한 행",
-                     len(out["result"]["events"] if out["mode"] == "timeseries" else out["result"]["outliers"]))
-            st.caption(out["notice"])
-            if mode_ko[mode_label] == "auto" and out["mode"] == "table":
-                st.info("시간 열을 찾지 못해 표 모드로 돌았어요. 센서처럼 행 순서가 시간인 데이터라면 위에서 '시계열'을 고르세요.")
-            st.markdown("**데이터 점검**")
-            st.dataframe(pd.DataFrame(check_table(out)), width="stretch", hide_index=True)
-            st.markdown("**이벤트**" if out["mode"] == "timeseries" else "**확인이 필요한 행**")
-            st.dataframe(pd.DataFrame(events_table(out)), width="stretch", hide_index=True)
-            with st.expander("기본 리포트 (AI 없이 요약에서 바로 만든 글)"):
-                st.markdown(report_text(out))
-
-            st.markdown("**AI 리포트**")
-            st.caption("AI에게는 아래 '보내는 내용'(집계 요약)만 보내요. 리포트 속 숫자는 숫자 검증기로 요약과 대조하고, 틀리면 최대 2번 다시 쓰게 해요.")
-            api_key, model = ai_settings()
-            writers = ["가짜 AI (시험용 · 숫자 하나를 일부러 틀림)"] + ([f"Claude ({model})"] if api_key else [])
-            writer_label = st.radio("리포트 작성자", writers, horizontal=True)
-            if not api_key:
-                st.caption("Streamlit Secrets에 ANTHROPIC_API_KEY가 없어서 실제 AI는 꺼져 있어요. 가짜 AI로 검증·재작성 흐름만 시험할 수 있어요.")
-            with st.expander("AI에게 보내는 내용 (원본 행 없음)"):
-                st.json(out["summary"])
-            if st.button("AI 리포트 만들기"):
-                writer = claude_writer(api_key, model) if writer_label.startswith("Claude") else fake_writer(report_text(out), out["summary"])
-                try:
-                    st.session_state["ai_last"] = cached_report(out["summary"], writer_label, writer)
-                except RuntimeError as e:
-                    st.session_state.pop("ai_last", None)
-                    st.error(f"{e} 기본 리포트를 대신 쓰세요.")
-            res = st.session_state.get("ai_last")
-            if res:
-                a, b, c = st.columns(3)
-                a.metric("숫자 검증", "통과" if res["passed"] else "실패")
-                b.metric("요약과 맞는 숫자", f"{res['check']['ok']} / {res['check']['total']}")
-                c.metric("쓴 횟수", f"{len(res['attempts'])}번", f"이 접속 AI 호출 {st.session_state.get('ai_calls', 0)}/{AI_CALL_LIMIT}", delta_color="off")
-                if res["passed"]:
-                    st.success("리포트의 숫자가 모두 계산값 요약에 있어요. (숫자가 맞는 자리에 쓰였는지는 사람이 확인해야 해요.)")
-                else:
-                    st.warning(f"다시 써도 요약에 없는 숫자가 남았어요: {', '.join(res['check']['bad'])}. 이 리포트는 쓰지 말고 기본 리포트를 쓰세요.")
-                st.markdown(res["report"])
-                with st.expander("시도별 기록"):
-                    for i, t in enumerate(res["attempts"], 1):
-                        bad = t["check"]["bad"]
-                        st.markdown(f"**{i}번째** · " + (f"요약에 없는 숫자: {', '.join(bad)}" if bad else "통과"))
-
-with t_bench:
-    st.subheader("이상 종류 × 크기별 재현율")
-    st.caption(f"총 {L['bench']['runs']}회 · 기준값 k = {L['bench']['k']} · HTML 시안에 저장된 결과")
-    rows = []
-    for g in L["bench"]["grid"]:
-        for cell in g["cells"]:
-            row = {"이상 종류": g["name"], "단위": g.get("unit", "")}
-            row.update({key: val for key, val in cell.items() if not isinstance(val, (list, dict))})
-            rows.append(row)
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.caption("표 모드는 한 행의 값만 바꿔서 그 행이 '확인이 필요한 행'에 들어가는지 봐요. 낮은 쪽 값이 음수가 되는 칸은 실험하지 않아요.")
 
 with t_k:
-    st.subheader("기준값 k에 따른 정밀도·재현율·F1")
-    pts = pd.DataFrame(L["sweep"]["pts"]).set_index("k")[["precision", "recall", "f1"]]
-    st.line_chart(pts)
-    st.metric("최고 F1을 낸 k", L["sweep"]["best"]["k"], f"F1 {L['sweep']['best']['f1']:.3f}", delta_color="off")
-    st.dataframe(pts.round(3), width="stretch")
-
-with t_ver:
-    st.subheader("숫자 검증기 직접 써 보기")
-    st.caption("리포트 속 숫자가 계산값 요약에 있는지 하나씩 대조해요. AI 리포트를 검사할 때와 같은 공용 엔진 함수(verify_numbers)를 써요.")
-    st.caption("기본 예시는 보험계리 페이지의 계산값이에요(관측 빈도·검증 A/E·학습자료 평균 순보험료). 240.5는 일부러 틀리게 쓴 숫자예요.")
-    col1, col2 = st.columns(2)
-    summary = col1.text_area("계산값 요약", '{"관측_빈도": 0.1061, "검증_A_E_건수": 1.022, "순보험료": 235.9}', height=140)
-    report = col2.text_area("리포트", "관측 빈도는 0.1061이고 검증 A/E는 1.022다. 순보험료는 240.5유로다.", height=140)
-    chk = verify_numbers(report, summary)
-    if not chk["total"]:
-        st.info("검사할 숫자가 없어요. (10 이하 정수는 목록 번호일 수 있어 건너뛰어요.)")
-    elif chk["bad"]:
-        st.warning(f"숫자 {chk['total']}개 중 {len(chk['bad'])}개가 계산값에 없어요: {', '.join(chk['bad'])}")
-    else:
-        st.success(f"숫자 {chk['total']}개가 모두 계산값과 맞아요.")
-    st.caption("반올림 차이(약 0.6%)와 두 계산값의 차이를 인용한 경우는 맞는 것으로 봐요. 숫자가 맞는 자리에 쓰였는지는 보지 않아요.")
-    st.subheader("기존 시험 결과")
-    V = L["verifier"]
-    a, b, c = st.columns(3)
-    a.metric("바꾼 숫자 중 잡은 수", f"{V['caught']} / {V['totalChanged']}")
-    b.metric("변조 리포트 적발률", f"{V['reportRecall']:.0%}")
-    c.metric("깨끗한 리포트 오경보", f"{V['falseAlarm']}건 / {V['nClean']}건")
-    case_id = st.selectbox("시험 리포트", range(len(V["cases"])), format_func=lambda i: V["cases"][i]["id"] + (" · 변조" if V["cases"][i]["tampered"] else " · 원본"))
-    st.markdown(V["cases"][case_id]["report"])
+    st.subheader("기준값 k를 바꾸면 이 파일에서 어떻게 달라지나")
+    st.caption("k마다 크기 4σ(표 모드는 4σ·×10) 이상을 다시 심어 재현율·정밀도를 재고, 실험 구간의 원래 데이터에서 몇 개가 표시되는지 셌어요.")
+    kp = pd.DataFrame(kpts)
+    fig = go.Figure()
+    for col, color, dash in (("재현율", BLUE, "solid"), ("정밀도", ORANGE, "solid"), ("F1", GRAY, "dot")):
+        fig.add_trace(go.Scatter(x=kp["k"], y=kp[col], name=col, mode="lines+markers", line=dict(color=color, width=2, dash=dash),
+                                 marker=dict(size=8), hovertemplate=f"k=%{{x}}<br>{col} %{{y:.2f}}<extra></extra>"))
+    fig.add_vline(x=k, line_dash="dash", line_color=GRAY, annotation_text="지금 k")
+    fig.update_layout(height=300, margin=dict(t=20, b=40), yaxis=dict(range=[0, 1.05], title=""), xaxis_title="k", legend=dict(orientation="h"))
+    st.plotly_chart(fig, width="stretch")
+    fig2 = go.Figure(go.Bar(x=[str(x) for x in kp["k"]], y=kp["원래 데이터 표시 수"], marker_color=BLUE,
+                            hovertemplate="k=%{x}<br>%{y}개<extra></extra>"))
+    fig2.update_layout(height=220, margin=dict(t=30, b=40), title=dict(text="원래 데이터에서 표시된 수 (적을수록 조용함)", font=dict(size=14)),
+                       xaxis_title="k")
+    st.plotly_chart(fig2, width="stretch")
+    st.metric("이 파일에서 F1이 가장 높은 k", kbest["k"], f"F1 {kbest['F1']:.2f}", delta_color="off")
+    st.dataframe(kp, width="stretch", hide_index=True)
 
 with t_rob:
-    st.subheader("값 15개, 그중 하나가 튐")
-    st.caption("엑셀로 같은 계산을 해서 맞춰 보는 예제예요.")
-    text = st.text_input("값 (쉼표로 구분)", "10.2, 9.8, 10.1, 9.9, 10.0, 10.3, 9.7, 10.1, 9.9, 10.2, 10.0, 9.8, 18.5, 10.1, 9.9")
-    try:
-        vals = np.array([float(x) for x in text.split(",")])
-        m, s, z = robust_z(vals, len(vals))
-        a, b, c = st.columns(3)
-        a.metric("중앙값", f"{m:.3f}")
-        b.metric("MAD", f"{s / 1.4826:.3f}")
-        c.metric("1.4826 × MAD", f"{s:.3f}")
-        st.dataframe(pd.DataFrame({"값": vals, "robust z": np.round(z, 2)}), width="stretch")
-        st.latex(r"z_i = \frac{x_i - \mathrm{median}(x)}{1.4826 \times \mathrm{MAD}}")
-    except ValueError:
-        st.error("숫자를 쉼표로 구분해 입력해 주세요.")
-
-with t_ai:
-    st.subheader("AI에게 보내는 것과 보내지 않는 것")
-    col1, col2 = st.columns(2)
-    col1.markdown("**보내지 않음**\n- 원본 행 전체\n- 이름·연락처·주민번호 열\n- 한 사람·한 계약 단위의 값")
-    col2.markdown("**보냄**\n- 집계 통계와 이벤트 목록\n- 계산된 지표(A/E, AUC, RMSE)\n- 분야 기준 규칙과 출처")
-    st.subheader("비용·안정성 장치 (코드에 반영됨)")
-    st.markdown(f"- 틀린 숫자 다시 쓰기 최대 {AI_MAX_RETRIES}번 (`write_verified_report`)\n"
-                "- 같은 요약은 저장해 재사용 (`cached_report`, 접속 안에서)\n"
-                f"- 접속당 호출 {AI_CALL_LIMIT}번 상한 (`claude_writer`)\n"
-                "- 다시 써도 틀리면 AI 리포트 대신 기본 리포트를 쓰라고 안내")
-    api_key, model = ai_settings()
-    if api_key:
-        st.success(f"AI 연결됨 · 모델 {model} · 이 접속에서 쓴 호출 {st.session_state.get('ai_calls', 0)}/{AI_CALL_LIMIT}번")
+    st.subheader("엔진의 robust Z를 손으로 다시 계산해 맞춰 보기")
+    if out["mode"] == "table":
+        st.caption("표 모드: 열 전체의 중앙값과 1.4826×MAD로 Z를 계산해요. 한쪽으로 치우친 0 이상 열은 로그로 바꿔서 계산해요.")
     else:
-        st.info("API 키가 아직 없어요. Streamlit Cloud의 앱 설정 → Secrets에 아래처럼 넣으면 '내 CSV로 돌려 보기' 탭에서 실제 AI를 고를 수 있어요. "
-                "키는 코드나 저장소에 넣지 마세요(.streamlit/secrets.toml은 .gitignore에 들어 있어요).")
+        st.caption(f"시계열 모드: 앞쪽 {out['base']['nb']}행(기준 구간)의 중앙값과 1.4826×MAD로 정상범위(중앙값 ± 3σ)를 잡아요. 빈칸은 앞뒤 값으로 채운 뒤 계산해요.")
+    st.latex(r"z_i = \frac{x_i - \mathrm{median}(x)}{1.4826 \times \mathrm{MAD}}, \quad \mathrm{MAD} = \mathrm{median}(|x_i - \mathrm{median}(x)|)")
+    st.dataframe(pd.DataFrame(rz_rows), width="stretch", hide_index=True)
+    if rz_examples:
+        st.markdown("**엔진이 표시한 값 몇 개**" + (" (엑셀로 같은 계산을 해서 맞춰 볼 수 있어요)" if out["mode"] == "table" else ""))
+        st.dataframe(pd.DataFrame(rz_examples), width="stretch", hide_index=True)
+
+with t_ver:
+    st.subheader("이 파일의 리포트로 숫자 검증기 시험")
+    st.caption("AI 리포트를 검사할 때 쓰는 공용 엔진 함수(verify_numbers)를 이 파일의 기본 리포트에 써 봐요. "
+               "리포트의 숫자를 하나씩 일부러 틀리게 바꿨을 때 잡아내는지 봐요. (10 이하 정수는 목록 번호일 수 있어 검사하지 않아요.)")
+    caught = sum(x["잡음"] for x in ver["cases"])
+    v1, v2 = st.columns(2)
+    v1.metric("바꾼 숫자 중 잡은 수", f"{caught} / {len(ver['cases'])}")
+    v2.metric("원래 리포트에서 틀렸다고 한 숫자", f"{len(ver['clean']['bad'])}개", help="0이어야 정상(오경보 없음)")
+    if ver["cases"]:
+        st.dataframe(pd.DataFrame(ver["cases"]), width="stretch", hide_index=True)
+        missed = [x for x in ver["cases"] if not x["잡음"]]
+        if missed:
+            st.caption("못 잡은 숫자는 바꾼 값이 요약의 다른 숫자(또는 두 숫자의 차이)와 우연히 가까운 경우예요. 숫자가 맞는 자리에 쓰였는지는 사람이 확인해야 해요.")
+    with st.expander("시험에 쓴 기본 리포트"):
+        st.markdown(ver["report"])
+
+# ---------------------------------------------------------------- 3. 종합 판정
+st.header("③ 종합 판정")
+st.caption("위 점검 결과를 모은 요약(원본 행 없음)으로 판정해요. AI를 쓰지 않은 기본 판정이 먼저 나오고, 원하면 AI가 더 읽기 쉽게 다시 써요.")
+base_verdict = verdict_text(S)
+api_key, model = ai_settings()
+writers = ["기본 판정 (AI 없음)", "가짜 AI (시험용 · 숫자 하나를 일부러 틀림)"] + ([f"Claude ({model})"] if api_key else [])
+writer_label = st.radio("판정 작성자", writers, horizontal=True)
+if not api_key:
+    st.caption("Streamlit Secrets에 ANTHROPIC_API_KEY가 없어서 실제 AI는 꺼져 있어요.")
+with st.expander("AI에게 보내는 내용 (원본 행 없음)"):
+    st.json(S)
+
+if writer_label.startswith("기본"):
+    st.markdown(base_verdict)
+else:
+    cur_key = report_key(S, writer_label)
+    if st.button("AI 판정 리포트 만들기"):
+        writer = claude_writer(api_key, model) if writer_label.startswith("Claude") else fake_writer(base_verdict, S)
+        try:
+            st.session_state["ai_last"] = {"key": cur_key, "res": cached_report(S, writer_label, writer)}
+        except RuntimeError as e:
+            st.session_state.pop("ai_last", None)
+            st.error(f"{e} 아래 기본 판정을 대신 보세요.")
+    last = st.session_state.get("ai_last")
+    rep = last["res"] if last and last.get("key") == cur_key else None
+    if last and rep is None:
+        st.caption("파일이나 설정이 바뀌어서 이전 AI 리포트는 숨겼어요. 'AI 판정 리포트 만들기'를 다시 누르세요.")
+    if rep:
+        x1, x2, x3 = st.columns(3)
+        x1.metric("숫자 검증", "통과" if rep["passed"] else "실패")
+        x2.metric("요약과 맞는 숫자", f"{rep['check']['ok']} / {rep['check']['total']}")
+        x3.metric("쓴 횟수", f"{len(rep['attempts'])}번", f"이 접속 AI 호출 {st.session_state.get('ai_calls', 0)}/{AI_CALL_LIMIT}", delta_color="off")
+        if rep["passed"]:
+            st.success("리포트의 숫자가 모두 점검 요약에 있어요. (숫자가 맞는 자리에 쓰였는지는 사람이 확인해야 해요.)")
+            st.markdown(rep["report"])
+        else:
+            st.warning(f"다시 써도 요약에 없는 숫자가 남았어요: {', '.join(rep['check']['bad'])}. 이 리포트 대신 기본 판정을 보세요.")
+            st.markdown(base_verdict)
+        with st.expander("시도별 기록"):
+            for i, t in enumerate(rep["attempts"], 1):
+                bad = t["check"]["bad"]
+                st.markdown(f"**{i}번째** · " + (f"요약에 없는 숫자: {', '.join(bad)}" if bad else "통과"))
+    else:
+        st.markdown(base_verdict)
+
+with st.expander("AI 사용 원칙과 비용 장치"):
+    st.markdown("**보내지 않음**: 원본 행, 이름·연락처·주민번호 열, 한 사람·한 건 단위의 값  \n"
+                "**보냄**: 위 점검 요약(진단 결과, 실험 재현율, k별 결과, 대조 결과)")
+    st.markdown(f"- 틀린 숫자 다시 쓰기 최대 {AI_MAX_RETRIES}번 · 같은 요약은 저장해 재사용\n"
+                f"- 접속당 {AI_CALL_LIMIT}번 + 앱 전체 하루 {AI_GLOBAL_LIMIT}번 상한 · 돈이 들지 않은 실패 호출은 횟수에서 뺌\n"
+                "- 리포트가 잘리거나 다시 써도 틀리면 기본 판정을 보여 줌")
+    st.caption("앱 전체 상한은 앱이 다시 시작되면 0부터 다시 세요. 돈이 드는 진짜 상한은 Anthropic 콘솔의 사용 한도로 꼭 걸어 두세요.")
+    if not api_key:
         st.code('ANTHROPIC_API_KEY = "sk-ant-..."\nAI_MODEL = "claude-haiku-5-5"   # 생략하면 이 값', language="toml")
