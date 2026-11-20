@@ -8,6 +8,7 @@ import re
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 import streamlit as st
@@ -217,25 +218,80 @@ def fit_all(freq, sev):
     return dict(df=df, train=train, valid=valid, f=f_model, s=s_model, phi=phi, phi_s=phi_s, nSev=len(sv))
 
 
-def rel_table(model, phi=1.0):
-    ci = model.conf_int()
-    rows = []
-    for k in BASE:
-        for name in model.params.index:
-            if name.startswith(f"C({k},"):
-                level = name.split("[T.")[1].rstrip("]")
-                b, se = model.params[name], model.bse[name] * np.sqrt(phi)
-                rows.append(dict(요인=LABEL[k], 수준=level, 배수=np.exp(b), 하한=np.exp(b - 1.96 * se), 상한=np.exp(b + 1.96 * se)))
-    return pd.DataFrame(rows).round(3)
+VARS = ["age", "veh", "bm", "area"]
+LEVELS = {"age": AGE, "veh": VEH, "bm": BM, "area": AREA}
 
 
-def rel_chart(tbl):
-    y = tbl["요인"] + " · " + tbl["수준"]
-    fig = go.Figure(go.Scatter(x=tbl["배수"], y=y, mode="markers", error_x=dict(type="data", symmetric=False, array=tbl["상한"] - tbl["배수"], arrayminus=tbl["배수"] - tbl["하한"])))
+def var_buttons(key, label="변수"):
+    """빈도·심도·순보험료 탭이 같이 쓰는 변수 버튼 줄이에요. 선택은 key로 저장돼 탭을 오가도 유지돼요."""
+    return st.radio(label, VARS, format_func=LABEL.get, horizontal=True, key=key)
+
+
+def rel_one(model, var, weights, scale=1.0, quasi=None):
+    """한 변수의 상대도 표. 기준 수준을 맨 위에 두고, 나머지는 원래 수준 순서대로 둬요.
+    scale: 표준오차에 곱할 분산 보정(√ 전), quasi: 준포아송 구간용 φ (없으면 열을 만들지 않아요)."""
+    rows = [dict(수준=BASE[var], 기준=True, 배수=1.0, 하한=None, 상한=None, 준하한=None, 준상한=None, 가중치=float(weights.get(BASE[var], 0)))]
+    for level in LEVELS[var]:
+        name = f'C({var}, Treatment("{BASE[var]}"))[T.{level}]'
+        if level == BASE[var] or name not in model.params.index:
+            continue
+        b, se = float(model.params[name]), float(model.bse[name]) * math.sqrt(scale)
+        row = dict(수준=level, 기준=False, 배수=math.exp(b), 하한=math.exp(b - 1.96 * se), 상한=math.exp(b + 1.96 * se), 준하한=None, 준상한=None, 가중치=float(weights.get(level, 0)))
+        if quasi is not None:
+            sq = se * math.sqrt(max(quasi, 1.0))
+            row.update(준하한=math.exp(b - 1.96 * sq), 준상한=math.exp(b + 1.96 * sq))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def rel_display(tbl, weight_col, quasi):
+    """화면용 표: 기준 행은 1.000 / - 로 보여 줘요."""
+    out = []
+    for r in tbl.itertuples():
+        row = {"수준": f"(기준) {r.수준}" if r.기준 else r.수준, "배수 exp(β)": f"{r.배수:.3f}", "95% 구간": "-" if r.기준 else f"{r.하한:.3f} – {r.상한:.3f}"}
+        if quasi:
+            row["준포아송 구간"] = "-" if r.기준 else f"{r.준하한:.3f} – {r.준상한:.3f}"
+        row[weight_col] = f"{r.가중치:,.0f}"
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+def rel_plot(tbl, lo, hi, weight_col, gray_cross=False):
+    """한 변수의 상대도 점 그래프. 로그 눈금이고 1이 항상 보여요."""
+    labels = [f"(기준) {l}" if b else l for l, b in zip(tbl["수준"], tbl["기준"])]
+    cross = [(not b) and l_ <= 1 <= h_ for b, l_, h_ in zip(tbl["기준"], tbl[lo].fillna(1), tbl[hi].fillna(1))]
+    colors = ["#555555" if b else ("#AAAAAA" if (gray_cross and c) else "#1F77B4") for b, c in zip(tbl["기준"], cross)]
+    err_hi = (tbl[hi].fillna(tbl["배수"]) - tbl["배수"]).tolist()
+    err_lo = (tbl["배수"] - tbl[lo].fillna(tbl["배수"])).tolist()
+    hover = [
+        f"{lab}<br>배수 {m:.3f}" + ("" if b else f"<br>구간 {l_:.3f} – {h_:.3f}") + f"<br>{weight_col} {w:,.0f}"
+        for lab, m, b, l_, h_, w in zip(labels, tbl["배수"], tbl["기준"], tbl[lo].fillna(1), tbl[hi].fillna(1), tbl["가중치"])
+    ]
+    fig = go.Figure(go.Scatter(
+        x=tbl["배수"], y=labels, mode="markers", marker=dict(size=11, color=colors),
+        error_x=dict(type="data", symmetric=False, array=err_hi, arrayminus=err_lo, color="#888888"),
+        hovertext=hover, hoverinfo="text",
+    ))
     fig.add_vline(x=1, line_dash="dash")
-    fig.update_xaxes(type="log", title="기준 수준 대비 배수 (로그 눈금)")
-    fig.update_layout(height=460, margin=dict(t=20))
+    xs = [v for v in tbl[lo].tolist() + tbl[hi].tolist() + [1.0] if v is not None and not pd.isna(v)]
+    pad = 0.08
+    fig.update_xaxes(type="log", title="기준 수준 대비 배수 (로그 눈금)", range=[math.log10(min(xs)) - pad, math.log10(max(xs)) + pad])
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(height=30 * len(tbl) + 110, margin=dict(t=20, b=40))
     return fig
+
+
+def rel_csv(model, weights_by_var, weight_col, scale=1.0, quasi=None):
+    """CSV는 변수 전체를 한 번에 내려받아 정보가 숨지 않게 해요."""
+    parts = []
+    for var in VARS:
+        t = rel_one(model, var, weights_by_var[var], scale, quasi).drop(columns=["기준"])
+        t.insert(0, "변수", LABEL[var])
+        parts.append(t.rename(columns={"하한": "95% 하한", "상한": "95% 상한", "준하한": "준포아송 하한", "준상한": "준포아송 상한", "가중치": weight_col}))
+    out = pd.concat(parts, ignore_index=True)
+    if quasi is None:
+        out = out.drop(columns=["준포아송 하한", "준포아송 상한"])
+    return out.to_csv(index=False).encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------- 신뢰도 (뷸만-스트라우브)
@@ -267,7 +323,7 @@ def cred_example():
     rows = []
     for i, (key, val) in enumerate(data.items()):
         ae = sum(p[1] for p in val) / (bs["xbar"] * bs["m"][i])
-        rows.append({"집단": key, "노출 m": bs["m"][i], "가중 평균 빈도": round(bs["xb"][i], 3), "Z": round(bs["Z"][i], 2), "A/E": round(ae, 2), "가중 A/E": round(bs["Z"][i] * ae + 1 - bs["Z"][i], 2)})
+        rows.append({"카테고리": key, "노출 m": bs["m"][i], "가중 평균 빈도": round(bs["xb"][i], 3), "Z": round(bs["Z"][i], 2), "A/E": round(ae, 2), "가중 A/E": round(bs["Z"][i] * ae + 1 - bs["Z"][i], 2)})
     return bs, rows
 
 
@@ -959,28 +1015,82 @@ with t_exp:
     orphan = (~sev["IDpol"].isin(freq["IDpol"])).sum()
     no_amt = ((df["ClaimNb"] > 0) & (df["nAmt"] == 0)).sum()
     st.caption(f"자료 점검: 빈도 표에 없는 청구 {orphan:,}건 · 청구건수는 있지만 금액이 없는 계약 {no_amt:,}건")
-    key = st.selectbox("집단", list(LABEL), format_func=LABEL.get)
-    g = df.groupby(key).agg(노출=("Exposure", "sum"), 금액건수=("nAmt", "sum"), 금액=("S", "sum"))
-    g["빈도"] = g["금액건수"] / g["노출"]
-    g["심도"] = g["금액"] / g["금액건수"].replace(0, np.nan)
-    st.dataframe(g.round(4), width="stretch")
-    st.bar_chart(g["빈도"])
+    st.subheader("카테고리별 빈도와 심도")
+    st.caption("같은 카테고리를 빈도와 심도로 나란히 봐요 · 전체 값 = 1.00 (지수) 또는 점선 (실제 값)")
+    cat_label = dict(LABEL)
+    if "region" in df.columns:
+        cat_label["region"] = "지역(Region)"
+    key = st.radio("카테고리", list(cat_label), format_func=cat_label.get, horizontal=True, key="exp_var")
+    view = st.radio("보기", ["지수로 보기", "실제 값으로 보기"], horizontal=True, key="exp_view")
+    g = df.groupby(key).agg(노출=("Exposure", "sum"), 청구건수=("nAmt", "sum"), 금액=("S", "sum"))
+    g = g.reindex([x for x in LEVELS[key] if x in g.index]) if key in LEVELS else g.sort_values("노출", ascending=False)
+    tot_f, tot_s = df["nAmt"].sum() / df["Exposure"].sum(), df["S"].sum() / df["nAmt"].sum()
+    g["빈도"] = g["청구건수"] / g["노출"]
+    g["심도"] = g["금액"] / g["청구건수"].where(g["청구건수"] > 0)  # 청구가 없으면 산출 불가(NaN)
+    g["빈도 지수"] = g["빈도"] / tot_f
+    g["심도 지수"] = g["심도"] / tot_s
+    g["손해원가 지수"] = (g["금액"] / g["노출"]) / (df["S"].sum() / df["Exposure"].sum())  # 청구가 있으면 빈도 지수 × 심도 지수와 같아요
+    cats = [str(c) for c in g.index]
+    no_claim = [c for c, n in zip(cats, g["청구건수"]) if n == 0]
+    if view == "지수로 보기":
+        fig = go.Figure([go.Bar(x=cats, y=g[col], name=col) for col in ("빈도 지수", "심도 지수", "손해원가 지수")])
+        fig.add_hline(y=1, line_dash="dash", annotation_text="전체 = 1.00")
+        for c in no_claim:
+            fig.add_annotation(x=c, y=0.05, text="청구 없음 · 산출 불가", showarrow=False, textangle=-90, yanchor="bottom")
+        fig.update_layout(barmode="group", height=360, yaxis_title="전체 대비 지수", margin=dict(t=20))
+        st.plotly_chart(fig)
+        st.caption("손해원가 지수 = 빈도 지수 × 심도 지수예요. 빈도와 심도가 서로 반대로 움직이는 카테고리를 한눈에 볼 수 있어요.")
+    else:
+        fig = make_subplots(rows=1, cols=2, shared_yaxes=True, subplot_titles=("빈도 (건/계약년)", "심도 (€/청구)"), horizontal_spacing=0.06)
+        fig.add_bar(y=cats, x=g["빈도"], orientation="h", name="빈도", row=1, col=1)
+        fig.add_bar(y=cats, x=g["심도"], orientation="h", name="심도", row=1, col=2)
+        fig.add_vline(x=tot_f, line_dash="dash", row=1, col=1, annotation_text=f"전체 {tot_f:.4f}")
+        fig.add_vline(x=tot_s, line_dash="dash", row=1, col=2, annotation_text=f"전체 €{tot_s:,.0f}")
+        for c in no_claim:
+            fig.add_annotation(x=0, y=c, xref="x2", yref="y2", text="청구 없음 · 산출 불가", showarrow=False, xanchor="left")
+        fig.update_yaxes(autorange="reversed")
+        fig.update_layout(height=34 * len(cats) + 120, showlegend=False, margin=dict(t=40))
+        st.plotly_chart(fig)
+    show = pd.DataFrame({
+        "카테고리": cats,
+        "노출(계약년)": [f"{v:,.1f}" for v in g["노출"]],
+        "청구 건수": [f"{int(v):,}" for v in g["청구건수"]],
+        "빈도": [f"{v:.4f}" for v in g["빈도"]],
+        "심도(€)": ["청구 없음 · 산출 불가" if pd.isna(v) else f"{v:,.0f}" for v in g["심도"]],
+        "빈도 지수": [f"{v:.3f}" for v in g["빈도 지수"]],
+        "심도 지수": ["-" if pd.isna(v) else f"{v:.3f}" for v in g["심도 지수"]],
+        "손해원가 지수": [f"{v:.3f}" for v in g["손해원가 지수"]],
+    })
+    st.dataframe(show, width="stretch", hide_index=True)
+    csv = g.reset_index().rename(columns={key: "카테고리"})
+    csv["비고"] = np.where(csv["청구건수"] == 0, "청구 없음 · 심도 산출 불가", "")
+    st.download_button("카테고리별 빈도·심도 CSV 내려받기", csv.to_csv(index=False).encode("utf-8-sig"), f"experience_{key}.csv", "text/csv")
 
 with t_freq:
     st.subheader("포아송 빈도 GLM 상대도")
     st.latex(r"\log \lambda_i = \log t_i + \beta_0 + \sum_k \beta_k x_{ik}")
     st.metric("과산포 φ (피어슨)", f"{M['phi']:.3f}")
-    tbl = rel_table(M["f"], max(M["phi"], 1))
-    st.plotly_chart(rel_chart(tbl))
-    st.dataframe(tbl, width="stretch", hide_index=True)
-    st.caption("구간은 √φ배 넓힌 준포아송 95% 구간이에요. 구간이 1을 지나면 차이가 확실하지 않아요.")
+    f_var = var_buttons("freq_var")
+    f_w = {v: train.groupby(v)["Exposure"].sum() for v in VARS}
+    f_tbl = rel_one(M["f"], f_var, f_w[f_var], 1.0, M["phi"])
+    st.caption(f"기준: {BASE[f_var]} · 학습 노출 {f_w[f_var].get(BASE[f_var], 0):,.0f}계약년 · 그래프 구간은 √φ배 넓힌 준포아송 95% 구간")
+    st.plotly_chart(rel_plot(f_tbl, "준하한", "준상한", "학습 노출(계약년)"))
+    st.dataframe(rel_display(f_tbl, "학습 노출(계약년)", quasi=True), width="stretch", hide_index=True)
+    st.caption("준포아송 구간은 분산만 √φ배 키운 구간이고 음이항과 같은 모형은 아니에요. 구간이 1을 지나면 차이가 확실하지 않아요.")
+    st.download_button("빈도 상대도 CSV 내려받기 (변수 전체)", rel_csv(M["f"], f_w, "학습 노출(계약년)", 1.0, M["phi"]), "frequency_relativities.csv", "text/csv")
 
 with t_sev:
     st.subheader("감마 심도 GLM 상대도")
-    st.caption(f"금액이 있는 학습 계약 {M['nSev']:,}건 · 계약별 평균 금액을 건수로 가중")
-    tbl = rel_table(M["s"], M["phi_s"] / float(M["s"].scale))
-    st.plotly_chart(rel_chart(tbl))
-    st.dataframe(tbl, width="stretch", hide_index=True)
+    s_var = var_buttons("sev_var")
+    sv_train = train[train["nAmt"] > 0]
+    s_w = {v: sv_train.groupby(v)["nAmt"].sum() for v in VARS}
+    s_scale = M["phi_s"] / float(M["s"].scale)
+    s_tbl = rel_one(M["s"], s_var, s_w[s_var], s_scale)
+    st.caption(f"기준: {BASE[s_var]} · 청구 {s_w[s_var].get(BASE[s_var], 0):,.0f}건 · 금액이 있는 학습 계약 {M['nSev']:,}건 · 계약별 평균 금액을 건수로 가중")
+    st.plotly_chart(rel_plot(s_tbl, "하한", "상한", "청구 건수(가중치)", gray_cross=True))
+    st.dataframe(rel_display(s_tbl, "청구 건수(가중치)", quasi=False), width="stretch", hide_index=True)
+    st.caption("95% 구간은 분산 모수 φ를 반영했어요. 회색 점은 구간이 1을 지나서 차이가 확실하지 않은 수준이에요. 심도는 빈도보다 구간이 훨씬 넓어요.")
+    st.download_button("심도 상대도 CSV 내려받기 (변수 전체)", rel_csv(M["s"], s_w, "청구 건수(가중치)", s_scale), "severity_relativities.csv", "text/csv")
 
 with t_pp:
     st.subheader("계약 하나의 순보험료")
@@ -996,6 +1106,15 @@ with t_pp:
     pp_total = (M["f"].predict(train, offset=np.log(train["Exposure"])) * M["s"].predict(train)).sum()
     st.metric("학습자료 평균 순보험료", f"€{pp_total / train['Exposure'].sum():,.1f}/계약년")
     st.caption("빈도와 심도가 서로 독립이라는 가정 아래 곱해요. 사업비·이익은 들어 있지 않아요.")
+    st.subheader("요인별 배수: 빈도 × 심도 = 순보험료")
+    p_var = var_buttons("pp_var")
+    pf = rel_one(M["f"], p_var, {}).set_index("수준")["배수"]
+    ps = rel_one(M["s"], p_var, {}).set_index("수준")["배수"]
+    st.caption(f"각 GLM의 기준 수준({BASE[p_var]}) 대비 · 다른 요인은 고정")
+    st.dataframe(
+        pd.DataFrame([{"수준": f"(기준) {lv}" if lv == BASE[p_var] else lv, "빈도 배수": f"{pf[lv]:.3f}", "심도 배수": f"{ps[lv]:.3f}", "순보험료 배수": f"{pf[lv] * ps[lv]:.3f}"} for lv in pf.index if lv in ps.index]),
+        width="stretch", hide_index=True,
+    )
 
 with t_val:
     st.subheader("검증자료 A/E")
@@ -1009,14 +1128,14 @@ with t_val:
     group_label = dict(LABEL)
     if "region" in v.columns:
         group_label["region"] = "지역(Region)"
-    key2 = st.selectbox("A/E 집단", list(group_label), format_func=group_label.get, key="ae_key")
+    key2 = st.selectbox("A/E 카테고리", list(group_label), format_func=group_label.get, key="ae_key")
     vg_rows, vg_bs = val_groups(v, key2)
     a, b, c = st.columns(3)
-    a.metric("집단 안 변동 EPV", f"{vg_bs['EPV']:.3f}")
-    b.metric("집단 간 변동 VHM", f"{vg_bs['VHM']:.2e}" if vg_bs["VHM"] > 0 else "0 이하")
+    a.metric("카테고리 안 변동 EPV", f"{vg_bs['EPV']:.3f}")
+    b.metric("카테고리 간 변동 VHM (교재의 집단 간 변동)", f"{vg_bs['VHM']:.2e}" if vg_bs["VHM"] > 0 else "0 이하")
     c.metric("k = EPV ÷ VHM", f"{vg_bs['k']:,.0f}" if math.isfinite(vg_bs["k"]) else "∞")
     if vg_bs["VHM"] <= 0:
-        st.caption("VHM이 0 이하면 모형이 집단 차이를 이미 설명한다는 뜻이라 Z = 0이에요.")
+        st.caption("VHM이 0 이하면 모형이 카테고리 차이를 이미 설명한다는 뜻이라 Z = 0이에요.")
     st.latex(r"Z=\frac{\text{예상 건수}}{\text{예상 건수}+k},\quad \text{가중 A/E}=Z\times A/E+(1-Z)")
     st.dataframe(
         pd.DataFrame([{group_label[key2]: o["key"], "계약": o["policies"], "노출": round(o["expo"], 1), "실제 건수": o["claims"], "예상 건수": round(o["E"], 1), "A/E 건수": round(o["aeN"], 3), "A/E 금액": round(o["aeS"], 3), "Z": round(o["Z"], 3), "가중 A/E 건수": round(o["credAE"], 3), "우연일 확률": round(o["pUp"] if o["credAE"] >= 1 else o["pDown"], 4), "판정": o["flag"]} for o in vg_rows]),
@@ -1024,7 +1143,7 @@ with t_val:
     )
     st.plotly_chart(go.Figure(go.Bar(x=[o["key"] for o in vg_rows], y=[o["aeN"] for o in vg_rows], name="A/E 건수")).add_scatter(x=[o["key"] for o in vg_rows], y=[o["credAE"] for o in vg_rows], mode="markers", name="가중 A/E 건수").add_hline(y=1, line_dash="dash").update_layout(height=320, margin=dict(t=20)))
     st.caption("판정: 가중 A/E 건수 ≥ 1.05이고 포아송 단측 p < 0.05면 높음, ≤ 0.95이고 반대쪽 p < 0.05면 낮음, Z < 0.3이면 자료 부족이에요. A/E가 1보다 크다는 것만으로 구조적 악화나 보험료 인상 필요를 확정하지 않아요.")
-    st.subheader("신뢰도 검산 예제: 집단 3개")
+    st.subheader("신뢰도 검산 예제: 카테고리 3개")
     ex_bs, ex_rows = cred_example()
     st.dataframe(pd.DataFrame(ex_rows), width="stretch", hide_index=True)
     ex_ok = abs(ex_bs["EPV"] - 0.359) < 0.0005 + 1e-9 and abs(ex_bs["VHM"] - 0.335) < 0.0005 + 1e-9 and abs(ex_bs["k"] - 1.07) < 0.005 + 1e-9
@@ -1032,7 +1151,7 @@ with t_val:
 
 with t_excel:
     st.subheader("엑셀 재현판")
-    st.caption("아래 CSV를 엑셀에 붙이고 같은 표를 수식으로 다시 만들어 앱 값과 대조해요. 2행 = 검증자료 첫 집단이에요.")
+    st.caption("아래 CSV를 엑셀에 붙이고 같은 표를 수식으로 다시 만들어 앱 값과 대조해요. 2행 = 검증자료 첫 카테고리예요.")
     xl_key = "region" if "region" in v.columns else "age"
     xl_col = "Region" if xl_key == "region" else "Group"
     xl = df.copy()
@@ -1049,7 +1168,7 @@ with t_excel:
     st.dataframe(
         pd.DataFrame(
             [
-                ["A 집단", "(집단 이름)", str(r0["key"])],
+                ["A 카테고리", "(카테고리 이름)", str(r0["key"])],
                 ["B 노출", f'=SUMIFS(Exposure, {xl_col}, A2, Split, "검증")', f"{r0['expo']:,.2f}"],
                 ["C 실제 건수", f'=SUMIFS(N, {xl_col}, A2, Split, "검증")', str(r0["claims"])],
                 ["D 예상 건수", f'=SUMIFS(PredCount, {xl_col}, A2, Split, "검증")', f"{r0['E']:,.2f}"],
@@ -1065,13 +1184,13 @@ with t_excel:
         width="stretch", hide_index=True,
     )
     st.caption(f"PredCount = Exposure × lambda, PredLoss = PredCount × mu. k = {xl_bs['k']:,.1f}" if math.isfinite(xl_bs["k"]) else "VHM이 0 이하라 k = ∞, Z = 0이에요.")
-    st.markdown("**처음 10개 집단을 CSV 값으로 다시 계산해 앱 값과 대조**")
+    st.markdown("**처음 10개 카테고리를 CSV 값으로 다시 계산해 앱 값과 대조**")
     xl_val = xl[xl["Split"] == "검증"]
     compare = []
     for o in xl_rows[:10]:
         part = xl_val[xl_val[xl_col] == o["key"]]
         same = abs(part["N"].sum() / part["PredCount"].sum() - o["aeN"]) < 1e-9 and abs(part["ClaimTotal"].sum() / part["PredLoss"].sum() - o["aeS"]) < 1e-9
-        compare.append({"집단": o["key"], "CSV A/E 건수": round(part["N"].sum() / part["PredCount"].sum(), 4), "앱 A/E 건수": round(o["aeN"], 4), "CSV A/E 금액": round(part["ClaimTotal"].sum() / part["PredLoss"].sum(), 4), "앱 A/E 금액": round(o["aeS"], 4), "결과": "일치" if same else "다름"})
+        compare.append({"카테고리": o["key"], "CSV A/E 건수": round(part["N"].sum() / part["PredCount"].sum(), 4), "앱 A/E 건수": round(o["aeN"], 4), "CSV A/E 금액": round(part["ClaimTotal"].sum() / part["PredLoss"].sum(), 4), "앱 A/E 금액": round(o["aeS"], 4), "결과": "일치" if same else "다름"})
     st.dataframe(pd.DataFrame(compare), width="stretch", hide_index=True)
 
 with t_res:
