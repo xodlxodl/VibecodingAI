@@ -2,6 +2,7 @@
 빈도 GLM × 심도 GLM → 순보험료 → 검증 A/E, 지급준비금(Chain Ladder).
 예시 데이터는 freMTPL2 구조를 흉내 낸 시뮬레이션이에요. HTML과 같은 난수열로 만들어 같은 자료를 재현해요.
 """
+import io
 import math
 import re
 
@@ -199,23 +200,110 @@ def simulate(n=50000, seed=678013):
     return freq, pd.DataFrame({"IDpol": ids, "ClaimAmount": amounts})
 
 
-@st.cache_data
-def fit_all(freq, sev):
+def valid_mask(ids):
+    """is_valid_id와 같은 해시를 배열 전체에 한 번에 계산해요 (계약 수십만 건용)."""
+    h = np.floor(np.abs(np.asarray(ids, dtype=float)) + 0.5).astype(np.uint64) & np.uint64(MASK32)
+    for _ in range(2):
+        h ^= h >> np.uint64(16)
+        h = (h * np.uint64(0x45D9F3B)) & np.uint64(MASK32)
+    h ^= h >> np.uint64(16)
+    return h % np.uint64(100) < np.uint64(25)
+
+
+def _fit_all(freq, sev):
+    """계약별로 GLM을 돌리지 않고, 같은 등급 조합(칸)끼리 합쳐서 돌려요.
+    포아송은 칸별 청구 수·노출 합, 감마는 칸별 금액 합 ÷ 건수(가중치 = 건수)를 쓰면 계약별로 돌린 것과 계수·표준오차가 같아요.
+    계약 수십만 건도 칸 수백 개만 계산하므로 빠르고 메모리를 적게 써요. (cache_resource: 큰 표를 복사하지 않고 공유해요)"""
+    keys = list(BASE)
     amt = sev.groupby("IDpol")["ClaimAmount"].agg(["sum", "count"]).rename(columns={"sum": "S", "count": "nAmt"})
     df = add_bands(freq).merge(amt, how="left", left_on="IDpol", right_index=True).fillna({"S": 0, "nAmt": 0})
-    df["valid"] = df["IDpol"].map(is_valid_id)
-    train, valid = df[~df["valid"]], df[df["valid"]]
+    df["valid"] = valid_mask(df["IDpol"].to_numpy())
+    train_mask = ~df["valid"]
+    for k in keys:  # 학습자료에 없는 등급이 검증자료에만 있으면 예측할 수 없어요
+        extra = sorted(set(df[k]) - set(df.loc[train_mask, k]))
+        if extra:
+            raise ValueError(f"{LABEL[k]}의 {extra} 등급이 학습자료(75%)에 없어 예측할 수 없어요.")
+        if BASE[k] not in set(df.loc[train_mask, k]):
+            raise ValueError(f"{LABEL[k]}의 기준 등급 {BASE[k]}이 학습자료에 없어요.")
     terms = " + ".join(f'C({k}, Treatment("{BASE[k]}"))' for k in BASE)
     # 빈도는 금액 기록이 있는 청구 수(nAmt)로 세요. 그래야 빈도 × 심도가 실제 금액과 같은 범위를 봐요.
-    f_model = smf.glm(f"nAmt ~ {terms}", train, family=sm.families.Poisson(), offset=np.log(train["Exposure"])).fit()
-    sv = train[train["nAmt"] > 0].copy()
-    sv["avg"] = sv["S"] / sv["nAmt"]
-    s_model = smf.glm(f"avg ~ {terms}", sv, family=sm.families.Gamma(sm.families.links.Log()), freq_weights=sv["nAmt"]).fit()
-    phi = float((f_model.resid_pearson ** 2).sum() / f_model.df_resid)
-    # 감마 φ의 자유도는 계약 수 기준이에요. freq_weights의 기본값은 건수 합 기준이라 직접 계산해요.
-    m_sv = s_model.predict(sv)
-    phi_s = float((sv["nAmt"] * ((sv["avg"] - m_sv) / m_sv) ** 2).sum() / (len(sv) - len(s_model.params)))
+    fc = df[train_mask].groupby(keys, observed=True).agg(nAmt=("nAmt", "sum"), Exposure=("Exposure", "sum")).reset_index()
+    f_model = smf.glm(f"nAmt ~ {terms}", fc, family=sm.families.Poisson(), offset=np.log(fc["Exposure"])).fit()
+    sc = df[train_mask & (df["nAmt"] > 0)].groupby(keys, observed=True).agg(N=("nAmt", "sum"), S=("S", "sum")).reset_index()
+    sc["avg"] = sc["S"] / sc["N"]
+    s_model = smf.glm(f"avg ~ {terms}", sc, family=sm.families.Gamma(sm.families.links.Log()), freq_weights=sc["N"]).fit()
+    # 칸별 예측(연간 빈도 rate, 건당 심도 mu)을 계약에 붙여요
+    cells = df[keys].drop_duplicates().reset_index(drop=True)
+    cells["rate"] = np.asarray(f_model.predict(cells, offset=np.zeros(len(cells))))
+    cells["mu"] = np.asarray(s_model.predict(cells))
+    df = df.merge(cells, on=keys, how="left")
+    train, valid = df[~df["valid"]], df[df["valid"]]
+    # φ는 계약 단위로 계산해요 (칸 단위로 계산하면 값이 달라져요)
+    m = train["Exposure"] * train["rate"]
+    phi = float((((train["nAmt"] - m) ** 2) / m).sum() / (len(train) - len(f_model.params)))
+    sv = train[train["nAmt"] > 0]
+    avg = sv["S"] / sv["nAmt"]
+    phi_s = float((sv["nAmt"] * ((avg - sv["mu"]) / sv["mu"]) ** 2).sum() / (len(sv) - len(s_model.params)))
     return dict(df=df, train=train, valid=valid, f=f_model, s=s_model, phi=phi, phi_s=phi_s, nSev=len(sv))
+
+
+fit_all = st.cache_resource(max_entries=2)(_fit_all)
+NUM_FREQ = ["IDpol", "ClaimNb", "Exposure", "VehAge", "DrivAge", "BonusMalus"]
+
+
+@st.cache_resource(max_entries=1, show_spinner="올린 자료를 정리하고 모형을 계산하는 중…")
+def fit_upload(f_bytes, s_bytes):
+    """올린 파일의 내용(바이트)으로 한 번만 읽고·정리하고·계산해요. 버튼을 눌러 화면이 다시 그려져도 다시 계산하지 않아요."""
+    f2, s2, notes = clean_upload(pd.read_csv(io.BytesIO(f_bytes)), pd.read_csv(io.BytesIO(s_bytes)))
+    return f2, s2, notes, _fit_all(f2, s2)
+
+
+def clean_upload(f2, s2):
+    """올린 빈도·심도 표를 점검하고 정리해요. 막아야 할 문제는 ValueError로, 고친 것은 안내 문구로 돌려줘요."""
+    notes = []
+    need_f = {"IDpol", "ClaimNb", "Exposure", "Area", "VehAge", "DrivAge", "BonusMalus"}
+    need_s = {"IDpol", "ClaimAmount"}
+    f2, s2 = f2.rename(columns=lambda c: str(c).strip()), s2.rename(columns=lambda c: str(c).strip())
+    missing = sorted((need_f - set(f2.columns)) | (need_s - set(s2.columns)))
+    if missing:
+        raise ValueError(f"빠진 열이 있어요: {missing}")
+    keep = [c for c in ["IDpol", "ClaimNb", "Exposure", "Area", "VehAge", "DrivAge", "BonusMalus", "Region"] if c in f2.columns]
+    f2, s2 = f2[keep].copy(), s2[["IDpol", "ClaimAmount"]].copy()
+    # freMTPL2 원본은 'C', 'R11'처럼 작은따옴표가 붙어 있어요
+    for c in ("Area", "Region"):
+        if c in f2.columns:
+            raw = f2[c].astype(str)
+            f2[c] = raw.str.strip().str.strip("'\"").str.strip()
+            if (raw != f2[c]).any():
+                notes.append(f"{c} 값을 감싼 따옴표를 뺐어요 (예: {raw.iloc[0]} → {f2[c].iloc[0]}).")
+    f2["Area"] = f2["Area"].str.upper()
+    for c in NUM_FREQ:
+        f2[c] = pd.to_numeric(f2[c].astype(str).str.replace(",", "").str.strip("'\" "), errors="coerce")
+    s2["IDpol"] = pd.to_numeric(s2["IDpol"], errors="coerce")
+    s2["ClaimAmount"] = pd.to_numeric(s2["ClaimAmount"].astype(str).str.replace(",", ""), errors="coerce")
+    bad = f2[NUM_FREQ].isna().any(axis=1)
+    if bad.any():
+        notes.append(f"숫자가 아니거나 비어 있는 계약 {int(bad.sum()):,}건을 뺐어요.")
+        f2 = f2[~bad]
+    wrong_area = ~f2["Area"].isin(AREA)
+    if wrong_area.all():
+        raise ValueError(f"Area 값이 A~F가 아니에요: {sorted(f2['Area'].unique())[:6]}")
+    if wrong_area.any():
+        notes.append(f"Area가 A~F가 아닌 계약 {int(wrong_area.sum()):,}건을 뺐어요: {sorted(f2.loc[wrong_area, 'Area'].unique())[:6]}")
+        f2 = f2[~wrong_area]
+    if f2["IDpol"].duplicated().any():
+        raise ValueError(f"빈도 표에 같은 IDpol이 {int(f2['IDpol'].duplicated().sum()):,}개 중복돼요. 계약 하나가 한 행이어야 해요.")
+    nonpos = int((f2["Exposure"] <= 0).sum())
+    if nonpos:
+        notes.append(f"노출이 0 이하인 계약 {nonpos:,}건을 뺐어요.")
+    f2 = f2[f2["Exposure"] > 0]
+    s_bad = s2["IDpol"].isna() | ~(s2["ClaimAmount"] > 0)
+    if s_bad.any():
+        notes.append(f"IDpol이 없거나 금액이 0 이하인 청구 {int(s_bad.sum()):,}건을 뺐어요.")
+    s2 = s2[~s_bad]
+    if len(f2) < 100 or len(s2) < 30:
+        raise ValueError(f"정리한 뒤 남은 자료가 너무 적어요 (계약 {len(f2):,}건, 청구 {len(s2):,}건).")
+    return f2, s2, notes
 
 
 VARS = ["age", "veh", "bm", "area"]
@@ -987,21 +1075,23 @@ with st.expander("데이터 올리기 (선택): 빈도 CSV와 심도 CSV를 IDpo
 
 freq, sev = simulate()
 source = "예시 데이터(시뮬레이션)"
+M = None
+if up_f and not up_s or up_s and not up_f:
+    st.warning("빈도 CSV와 심도 CSV를 둘 다 올려야 바뀌어요. 지금은 예시 데이터를 보여 줘요.")
 if up_f and up_s:
     try:
-        f2, s2 = pd.read_csv(up_f), pd.read_csv(up_s)
-        need_f = {"IDpol", "ClaimNb", "Exposure", "Area", "VehAge", "DrivAge", "BonusMalus"}
-        need_s = {"IDpol", "ClaimAmount"}
-        if need_f - set(f2.columns) or need_s - set(s2.columns):
-            st.error(f"빠진 열: {sorted((need_f - set(f2.columns)) | (need_s - set(s2.columns)))}")
-        else:
-            freq, sev = f2[f2["Exposure"] > 0], s2[s2["ClaimAmount"] > 0]
-            source = "올린 데이터"
+        f2, s2, notes, M = fit_upload(up_f.getvalue(), up_s.getvalue())
+        freq, sev, source = f2, s2, "올린 데이터"
+        for n_ in notes:
+            st.caption("자료 정리: " + n_)
+    except ValueError as e:
+        st.error(f"올린 자료를 쓸 수 없어 예시 데이터를 보여 줘요. {e}")
     except Exception as e:
-        st.error(f"CSV를 읽지 못했어요: {e}")
+        st.error(f"올린 자료로 모형을 계산하지 못해 예시 데이터를 보여 줘요. ({type(e).__name__}: {str(e)[:200]})")
 st.info(f"지금 보는 자료: {source} · 계약 {len(freq):,}건, 청구 금액 {len(sev):,}건")
 
-M = fit_all(freq, sev)
+if M is None:
+    M = fit_all(freq, sev)
 df, train, valid = M["df"], M["train"], M["valid"]
 
 t_exp, t_freq, t_sev, t_pp, t_val, t_excel, t_res = st.tabs(["경험통계", "빈도 GLM", "심도 GLM", "순보험료", "검증 · A/E · 신뢰도", "엑셀 재현판", "지급준비금(IBNR)"])
@@ -1103,7 +1193,7 @@ with t_pp:
     a.metric("예상 빈도 λ", f"{lam:.4f} 건/년")
     b.metric("예상 심도 μ", f"€{mu:,.0f}")
     c.metric("순보험료 λ × μ", f"€{lam * mu:,.1f}/계약년")
-    pp_total = (M["f"].predict(train, offset=np.log(train["Exposure"])) * M["s"].predict(train)).sum()
+    pp_total = (train["Exposure"] * train["rate"] * train["mu"]).sum()
     st.metric("학습자료 평균 순보험료", f"€{pp_total / train['Exposure'].sum():,.1f}/계약년")
     st.caption("빈도와 심도가 서로 독립이라는 가정 아래 곱해요. 사업비·이익은 들어 있지 않아요.")
     st.subheader("요인별 배수: 빈도 × 심도 = 순보험료")
@@ -1119,8 +1209,8 @@ with t_pp:
 with t_val:
     st.subheader("검증자료 A/E")
     v = valid.copy()
-    v["lam"] = M["f"].predict(v, offset=np.log(v["Exposure"]))
-    v["pure"] = v["lam"] * M["s"].predict(v)
+    v["lam"] = v["Exposure"] * v["rate"]
+    v["pure"] = v["lam"] * v["mu"]
     a, b, c = st.columns(3)
     a.metric("검증 계약", f"{len(v):,}건 (25%)")
     b.metric("A/E 건수", f"{v['nAmt'].sum() / v['lam'].sum():.3f}")
@@ -1154,15 +1244,16 @@ with t_excel:
     st.caption("아래 CSV를 엑셀에 붙이고 같은 표를 수식으로 다시 만들어 앱 값과 대조해요. 2행 = 검증자료 첫 카테고리예요.")
     xl_key = "region" if "region" in v.columns else "age"
     xl_col = "Region" if xl_key == "region" else "Group"
-    xl = df.copy()
-    xl["lambda"] = M["f"].predict(xl, offset=np.zeros(len(xl)))
-    xl["mu"] = M["s"].predict(xl)
-    xl["PredCount"] = xl["Exposure"] * xl["lambda"]
-    xl["PredLoss"] = xl["PredCount"] * xl["mu"]
-    xl["Split"] = np.where(xl["valid"], "검증", "학습")
-    xl[xl_col] = xl[xl_key]
-    xl = xl.rename(columns={"nAmt": "N", "S": "ClaimTotal"})[["IDpol", xl_col, "Split", "Exposure", "N", "lambda", "mu", "PredCount", "PredLoss", "ClaimTotal"]]
-    st.download_button("계약별 예측 CSV 내려받기", xl.to_csv(index=False).encode("utf-8-sig"), "policy_predictions.csv", "text/csv")
+    xl = pd.DataFrame({
+        "IDpol": df["IDpol"], xl_col: df[xl_key], "Split": np.where(df["valid"], "검증", "학습"), "Exposure": df["Exposure"], "N": df["nAmt"],
+        "lambda": df["rate"], "mu": df["mu"], "PredCount": df["Exposure"] * df["rate"], "PredLoss": df["Exposure"] * df["rate"] * df["mu"], "ClaimTotal": df["S"],
+    })
+    # 계약이 많으면 CSV 만들기가 무거워서, 누를 때만 만들어요
+    if st.button(f"계약별 예측 CSV 만들기 ({len(xl):,}행)", key="xl_make"):
+        st.session_state["xl_csv"] = (source, len(xl), xl.to_csv(index=False).encode("utf-8-sig"))
+    made = st.session_state.get("xl_csv")
+    if made and made[:2] == (source, len(xl)):
+        st.download_button("계약별 예측 CSV 내려받기", made[2], "policy_predictions.csv", "text/csv")
     xl_rows, xl_bs = val_groups(v, xl_key)
     r0 = xl_rows[0]
     st.dataframe(
