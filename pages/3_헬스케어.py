@@ -9,20 +9,29 @@
 """
 import io
 import re
+import warnings
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import statsmodels.api as sm
 import streamlit as st
 
 st.set_page_config(page_title="헬스케어", layout="wide")
 
-# ================================================================ 기준값 (원문 확인 후 출처·연도 확정)
-SODIUM_CDRR = 2300          # 나트륨 만성질환위험감소섭취량 (mg/일, 성인) · 2025 한국인 영양소 섭취기준
-CHO_RANGE = (50, 65)        # 탄수화물 에너지적정비율 (%) · 2025 KDRIs (2020: 55~65)
+# ================================================================ 기준값
+# 국건영 제9기(2022-2024)가 쓰는 2020 한국인 영양소 섭취기준(KDRIs)에 맞췄어요 (원시자료 이용지침서 SAS 프로그램 기준).
+# 2025 KDRIs 개정값으로 바꿀 때는 이 칸만 고치면 돼요.
+KDRI_NAME = "2020 한국인 영양소 섭취기준"
+# 에너지 필요추정량 (kcal/일): (성별, 나이 하한) → 값. 나이 구간 19~29, 30~49, 50~64, 65~74, 75 이상
+EER = {1: [(19, 2600), (30, 2500), (50, 2200), (65, 2000), (75, 1900)],
+       2: [(19, 2000), (30, 1900), (50, 1700), (65, 1600), (75, 1500)]}
+EN_HIGH, EN_LOW = 125, 75   # 필요추정량의 125% 초과 = 에너지 과잉, 75% 미만 = 에너지 부족 (국민건강통계 지표 정의)
+SODIUM_CDRR = [(19, 2300), (65, 2100), (75, 1700)]  # 나트륨 만성질환위험감소섭취량 (mg/일)
+CHO_RANGE = (55, 65)        # 탄수화물 에너지적정비율 (%)
 FAT_RANGE = (15, 30)        # 지방 에너지적정비율 (%)
-SUGAR_MAX = 20              # 총당류 에너지 비율 상한 (%) · 2025 KDRIs (첨가당은 10% 이내 제한)
-FIBER_AI = {"남": 30, "여": 20, "남65": 25}  # 식이섬유 충분섭취량 (g/일) · 2020 KDRIs 기준, 2025 개정값 확인 필요
+SUGAR_MAX = 20              # 총당류 에너지 비율 상한 (%) (첨가당은 10% 이내)
+FIBER_AI = {1: [(19, 30), (65, 25)], 2: [(19, 20)]}  # 식이섬유 충분섭취량 (g/일)
 ENERGY_OK = (500, 5000)     # 하루 섭취 열량이 이 범위를 벗어나면 식사 자료를 믿기 어려워 뺌 (과소·과대 보고)
 
 COLORS = {"정상": "#4C9F70", "위험군": "#E5A93C", "대사증후군": "#C8553D"}
@@ -38,11 +47,14 @@ FIELDS = {
     "hba1c": ("당화혈색소", False), "tc": ("총콜레스테롤", False), "fst": ("공복 시간 (8시간 미만이면 혈당 제외)", False),
     "dm_dx": ("당뇨 의사진단", False), "dm_med": ("혈당강하제 복용", False), "dm_ins": ("인슐린 주사", False),
     "ht_dx": ("고혈압 의사진단", False), "ht_med": ("혈압조절제 복용", False), "dl_dx": ("이상지질혈증 의사진단", False),
-    "smoke": ("흡연 상태", False), "drink": ("음주 (빈도 또는 Y/N)", False),
+    "prg": ("임신 여부 (임신부는 성인 기준에서 빼요)", False),
+    "smoke": ("현재 흡연 상태", False), "smoke_life": ("평생 흡연량 (5갑 이상 여부)", False),
+    "drink": ("음주 빈도 (또는 Y/N)", False), "drink_amt": ("한 번 음주량", False),
     "breakfast": ("아침식사 빈도", False), "eatout": ("외식 빈도", False),
-    "energy": ("에너지 섭취량 (kcal)", False), "cho": ("탄수화물 (g)", False), "fat": ("지방 (g)", False),
+    "energy": ("에너지 섭취량 (kcal)", False), "prot": ("단백질 (g)", False), "cho": ("탄수화물 (g)", False), "fat": ("지방 (g)", False),
     "sugar": ("당류 (g)", False), "fiber": ("식이섬유 (g)", False), "sodium": ("나트륨 (mg)", False),
     "wt": ("가중치 (없으면 표본 기준)", False),
+    "psu": ("조사구 (집락, 신뢰구간 계산용)", False), "strata": ("층 (신뢰구간 계산용)", False),
 }
 # 별명 사전: 대소문자·띄어쓰기·밑줄·괄호를 지운 뒤 비교해요. 국건영 이름은 이용지침서로 다시 확인할 것.
 ALIASES = {
@@ -61,22 +73,28 @@ ALIASES = {
     "tc": ["hechol", "tc", "totchole", "총콜레스테롤"],
     "fst": ["hefst", "fst", "공복시간"],
     "dm_dx": ["de1dg", "당뇨진단", "당뇨병의사진단"],
-    "dm_med": ["de131", "혈당강하제", "혈당강하제복용"],
-    "dm_ins": ["de132", "인슐린", "인슐린주사"],
+    "dm_med": ["de132", "혈당강하제", "혈당강하제복용"],   # 국건영 DE1_32 = 당뇨병약 복용
+    "dm_ins": ["de131", "인슐린", "인슐린주사"],          # 국건영 DE1_31 = 인슐린 주사
     "ht_dx": ["di1dg", "고혈압진단", "고혈압의사진단"],
     "ht_med": ["di12", "혈압조절제", "혈압조절제복용"],
     "dl_dx": ["di2dg", "이상지질혈증진단"],
+    "prg": ["heprg", "임신여부"],
     "smoke": ["bs31", "smkstattypecd", "smoke", "흡연", "흡연상태"],
+    "smoke_life": ["bs11", "평생흡연량"],
     "drink": ["bd111", "drkyn", "drink", "음주", "음주여부", "음주빈도"],
+    "drink_amt": ["bd21", "한번음주량", "음주량"],
     "breakfast": ["lbrfq", "아침식사빈도", "아침식사"],
     "eatout": ["loutfq", "외식빈도", "외식"],
     "energy": ["nen", "energy", "에너지", "열량"],
+    "prot": ["nprot", "단백질"],
     "cho": ["ncho", "탄수화물"],
     "fat": ["nfat", "지방"],
     "sugar": ["nsugar", "당류", "총당류"],
     "fiber": ["ntdf", "식이섬유"],
     "sodium": ["nna", "sodium", "나트륨"],
     "wt": ["wttot", "wtntr", "wtitvex", "weight_s", "가중치"],
+    "psu": ["psu", "조사구"],
+    "strata": ["kstrata", "strata", "층"],
 }
 NONE = "(없음)"
 VALID = {"age": (1, 120), "bmi": (10, 70), "height": (100, 220), "weight": (20, 250), "waist": (40, 200),
@@ -124,20 +142,64 @@ def yes_no(s):
     return s.map({1: 1, 0: 0, 8: 0}).astype(float)
 
 
-def smoke_now(s, colname):
-    """현재 흡연 여부. 공단 검진(SMK_STAT_TYPE_CD)은 3=현재 흡연, 국건영(BS3_1)은 1=매일·2=가끔 피움."""
+def med_flag(s):
+    """국건영 약 복용 빈도(DI1_2 등): 1=매일, 2=한 달 20일 이상, 3=15일 이상, 4=15일 미만 → 복용,
+    5=복용 안 함·8=비해당 → 0, 9=모름 → 빈칸. 0/1 열이나 Y/N 열도 처리해요."""
+    if not pd.api.types.is_numeric_dtype(s):
+        return yes_no(s)
+    return s.map({0: 0, 1: 1, 2: 1, 3: 1, 4: 1, 5: 0, 8: 0}).astype(float)
+
+
+def smoke_now(s, colname, life=None):
+    """현재 흡연. 국건영 공식 정의: 평생 5갑 이상(BS1_1=2) 피웠고 지금 매일·가끔 피움(BS3_1=1,2).
+    공단 검진(SMK_STAT_TYPE_CD)은 3=현재 흡연."""
     if norm(colname) == "smkstattypecd":
         return s.map({1: 0, 2: 0, 3: 1}).astype(float)
-    return s.map({1: 1, 2: 1, 3: 0, 8: 0}).astype(float)
+    now = s.map({1: 1, 2: 1, 3: 0, 8: 0}).astype(float)
+    if life is None:
+        return now
+    out = pd.Series(np.nan, index=s.index)
+    out[life.isin([1, 3])] = 0                       # 5갑 미만이거나 피운 적 없음
+    lifetime = life == 2
+    out[lifetime] = now[lifetime]                      # 5갑 이상이면 지금 피우는지로
+    return out
 
 
-def drink_flag(s):
-    """국건영 BD1_11(음주 빈도 1~6)이면 주 2회 이상(5·6)을 '잦은 음주'로, Y/N이면 음주 여부로."""
+def drink_flag(s, sex=None, amt=None):
+    """국건영 공식 고위험음주: 주 2회 이상(BD1_11=5,6) 마시고 한 번에 남 7잔(BD2_1=4,5)·여 5잔(BD2_1=3,4,5) 이상.
+    한 번 음주량이 없으면 주 2회 이상 음주로, Y/N이면 음주 여부로 대신해요."""
     if not pd.api.types.is_numeric_dtype(s):
         return yes_no(s), "음주함"
     if s.dropna().isin([0, 1]).all():
         return s.astype(float), "음주함"
-    return s.map({1: 0, 2: 0, 3: 0, 4: 0, 5: 1, 6: 1, 8: 0}).astype(float), "주 2회 이상 음주"
+    freq = s.map({1: 0, 2: 0, 3: 0, 4: 0, 5: 1, 6: 1, 8: 0}).astype(float)
+    if amt is None or sex is None:
+        return freq, "주 2회 이상 음주"
+    heavy = np.where(sex == 1, amt.isin([4, 5]), amt.isin([3, 4, 5])).astype(float)
+    heavy = pd.Series(heavy, index=s.index).where(amt.isin([1, 2, 3, 4, 5]))
+    out = freq.copy()
+    often = freq == 1
+    out[often] = heavy[often]                          # 자주 마시는 사람만 양으로 다시 판정
+    return out, "고위험음주"
+
+
+def by_age(table, age):
+    """[(나이 하한, 값), ...] 표에서 나이에 맞는 값을 골라요."""
+    out = pd.Series(np.nan, index=age.index)
+    for lo, v in table:
+        out[age >= lo] = v
+    return out
+
+
+def kdri(sex, age, table):
+    """성별·나이별 기준값. table은 {성별: [(나이 하한, 값), ...]} 또는 [(나이 하한, 값), ...]."""
+    if isinstance(table, list):
+        return by_age(table, age)
+    out = pd.Series(np.nan, index=age.index)
+    for sx, rows in table.items():
+        m = sex == sx
+        out[m] = by_age(rows, age[m])
+    return out
 
 
 def build_data(raw, mapping):
@@ -154,20 +216,27 @@ def build_data(raw, mapping):
     out["age"] = num("age")
 
     for k in ("height", "weight", "bmi", "waist", "sbp", "dbp", "glu", "tg", "hdl", "hba1c", "tc", "fst",
-              "energy", "cho", "fat", "sugar", "fiber", "sodium", "wt"):
+              "energy", "prot", "cho", "fat", "sugar", "fiber", "sodium", "wt"):
         out[k] = num(k) if mapping.get(k) else np.nan
+    for k in ("psu", "strata"):   # 조사구·층은 'A123' 같은 글자 ID일 수 있어서 그대로 둬요
+        out[k] = raw[mapping[k]].astype(str).where(raw[mapping[k]].notna()) if mapping.get(k) else np.nan
     if not mapping.get("bmi"):
         out["bmi"] = (out["weight"] / (out["height"] / 100) ** 2).round(1)
         notes.append("BMI 열이 없어 몸무게 ÷ 키(m)²로 계산했어요.")
 
-    for k in ("dm_dx", "dm_med", "dm_ins", "ht_dx", "ht_med", "dl_dx"):
+    for k in ("dm_dx", "dm_med", "dm_ins", "ht_dx", "dl_dx"):
         out[k] = yes_no(raw[mapping[k]]) if mapping.get(k) else np.nan
-    out["smoke"] = smoke_now(num("smoke"), mapping["smoke"]) if mapping.get("smoke") else np.nan
+    out["ht_med"] = med_flag(raw[mapping["ht_med"]]) if mapping.get("ht_med") else np.nan
+    if mapping.get("smoke"):
+        out["smoke"] = smoke_now(num("smoke"), mapping["smoke"], num("smoke_life") if mapping.get("smoke_life") else None)
+    else:
+        out["smoke"] = np.nan
+    meta["smoke_label"] = "현재 흡연" + ("" if mapping.get("smoke_life") else " (평생 흡연량 없이 판정)")
     meta["drink_label"] = "음주"
     if mapping.get("drink"):
         col = raw[mapping["drink"]]
         col = pd.to_numeric(col, errors="coerce") if pd.api.types.is_numeric_dtype(col) else col
-        out["drink"], meta["drink_label"] = drink_flag(col)
+        out["drink"], meta["drink_label"] = drink_flag(col, out["sex"], num("drink_amt") if mapping.get("drink_amt") else None)
     else:
         out["drink"] = np.nan
     # 아침식사 빈도(L_BR_FQ): 1=주5~7회, 2=주3~4회, 3=주1~2회, 4=거의 안 함 → 주 2회 이하를 결식으로
@@ -191,7 +260,7 @@ def build_data(raw, mapping):
 
     if mapping.get("energy"):
         odd = out["energy"].notna() & ~out["energy"].between(*ENERGY_OK)
-        out.loc[odd, ["energy", "cho", "fat", "sugar", "fiber", "sodium"]] = np.nan
+        out.loc[odd, ["energy", "prot", "cho", "fat", "sugar", "fiber", "sodium"]] = np.nan
         if odd.any():
             notes.append(f"하루 섭취 열량이 {ENERGY_OK[0]:,}kcal 미만이거나 {ENERGY_OK[1]:,}kcal 초과인 {int(odd.sum()):,}명은 식사 자료를 뺐어요 (과소·과대 보고 의심).")
 
@@ -199,6 +268,11 @@ def build_data(raw, mapping):
     out = out[out["age"] >= 19]
     if len(out) < before:
         notes.append(f"19세 미만 {before - len(out):,}명은 성인 기준을 쓰기 위해 뺐어요.")
+    if mapping.get("prg"):
+        preg = pd.to_numeric(raw.loc[out.index, mapping["prg"]], errors="coerce") == 1
+        out = out[~preg]
+        if preg.any():
+            notes.append(f"임신부 {int(preg.sum()):,}명은 허리둘레·혈당·섭취기준이 달라 뺐어요.")
     before = len(out)
     out = out.dropna(subset=["sex", "age", "bmi", "waist", "sbp", "dbp", "glu", "tg", "hdl"])
     if len(out) < before:
@@ -271,19 +345,26 @@ def simulate(n=6000, seed=11):
         "HE_ht": height.round(1), "HE_wt": weight.round(1), "HE_BMI": bmi.round(1), "HE_wc": waist.round(1),
         "HE_sbp": sbp.round(), "HE_dbp": dbp.round(), "HE_glu": glu.round(), "HE_HbA1c": hba1c.round(1),
         "HE_chol": tc.round(), "HE_TG": tg.round(), "HE_HDL_st2": hdl.round(), "HE_fst": np.where(r.random(n) < 0.05, 5, 12),
-        "DE1_dg": code(np.where(dm_dx, 1, 0)), "DE1_31": np.where(dm_dx, np.where(dm_med, 1, 0), 8),
-        "DE1_32": np.where(dm_dx, (r.random(n) < 0.1).astype(int), 8),
-        "DI1_dg": code(np.where(ht_dx, 1, 0)), "DI1_2": np.where(ht_dx, np.where(ht_med, 1, 0), 8),
+        "HE_prg": np.where(male == 1, 8, np.where((age < 45) & (r.random(n) < 0.01), 1, 0)),
+        "DE1_dg": code(np.where(dm_dx, 1, 0)), "DE1_31": np.where(dm_dx, (r.random(n) < 0.1).astype(int), 8),
+        "DE1_32": np.where(dm_dx, np.where(dm_med, 1, 0), 8),
+        "DI1_dg": code(np.where(ht_dx, 1, 0)), "DI1_2": np.where(ht_dx, np.where(ht_med, r.choice([1, 1, 1, 2, 4], n), 5), 8),
         "DI2_dg": code(np.where(dl_dx, 1, 0)),
-        "BS3_1": code(smoke), "BD1_11": code(drink), "L_BR_FQ": code(bf), "L_OUT_FQ": code(eatout),
-        "N_EN": energy.round(), "N_CHO": (energy * cho_p / 100 / 4).round(1), "N_FAT": (energy * fat_p / 100 / 9).round(1),
+        "BS1_1": np.where(smoke == 8, 3, np.where(r.random(n) < 0.95, 2, 1)),
+        "BS3_1": code(smoke), "BD1_11": code(drink),
+        "BD2_1": np.where(male == 1, r.choice([1, 2, 3, 4, 5], n, p=[0.2, 0.2, 0.2, 0.2, 0.2]), r.choice([1, 2, 3, 4, 5], n, p=[0.4, 0.25, 0.15, 0.12, 0.08])),
+        "L_BR_FQ": code(bf), "L_OUT_FQ": code(eatout),
+        "N_EN": energy.round(), "N_PROT": (energy * np.clip(100 - cho_p - fat_p, 8, 30) / 100 / 4).round(1),
+        "N_CHO": (energy * cho_p / 100 / 4).round(1), "N_FAT": (energy * fat_p / 100 / 9).round(1),
         "N_SUGAR": (energy * sug_p / 100 / 4).round(1), "N_TDF": (energy * fib_dens / 1000).round(1),
         "N_NA": (energy * na_dens).round(), "wt_tot": np.round(np.exp(np.log(7000) + 0.5 * g()) * np.where(age > 65, 0.8, 1.0)),
+        "kstrata": r.integers(1, 28, n),
     })
+    df["psu"] = df["kstrata"] * 10 + r.integers(0, 7, n)
     lab_miss = r.random(n) < 0.04
     df.loc[lab_miss, ["HE_TG", "HE_HDL_st2", "HE_chol", "HE_HbA1c"]] = np.nan
     diet_miss = r.random(n) < 0.12
-    df.loc[diet_miss, ["N_EN", "N_CHO", "N_FAT", "N_SUGAR", "N_TDF", "N_NA"]] = np.nan
+    df.loc[diet_miss, ["N_EN", "N_PROT", "N_CHO", "N_FAT", "N_SUGAR", "N_TDF", "N_NA"]] = np.nan
     return df
 
 
@@ -348,25 +429,54 @@ def add_status(df):
     df["undx_ht"] = ((df["sbp"] >= 140) | (df["dbp"] >= 90)) & (df["ht_dx"] != 1)
     df["undx_dl"] = ((df["tc"] >= 240) | (df["tg"] >= 200)) & (df["dl_dx"] != 1)
 
-    # 식사: 에너지 보정 (많이 먹는 사람이 모든 영양소를 많이 먹는 효과를 빼요)
-    df["cho_p"] = df["cho"] * 4 / df["energy"] * 100
-    df["fat_p"] = df["fat"] * 9 / df["energy"] * 100
-    df["sug_p"] = df["sugar"] * 4 / df["energy"] * 100
-    df["na_d"] = df["sodium"] / df["energy"] * 1000
-    df["fib_d"] = df["fiber"] / df["energy"] * 1000
+    # 식사: 성별·나이별 섭취기준(KDRIs)과 비교해요
+    # 에너지 비율 분모는 국건영 지침처럼 탄수화물·지방·단백질에서 온 열량의 합 (단백질이 없으면 총 에너지)
+    macro = df["cho"] * 4 + df["fat"] * 9 + df["prot"] * 4
+    denom = macro.where(df["prot"].notna(), df["energy"])
+    df["cho_p"] = df["cho"] * 4 / denom * 100
+    df["fat_p"] = df["fat"] * 9 / denom * 100
+    df["sug_p"] = df["sugar"] * 4 / denom * 100
+    df["eer"] = kdri(df["sex"], df["age"], EER)
+    df["en_eer"] = df["energy"] / df["eer"] * 100
+    df["na_lim"] = kdri(df["sex"], df["age"], SODIUM_CDRR)
+    df["fib_ai"] = kdri(df["sex"], df["age"], FIBER_AI)
     df["obese"] = (df["bmi"] >= 25).astype(float)
-    fib_ai = np.where(male, np.where(df["age"] >= 65, FIBER_AI["남65"], FIBER_AI["남"]), FIBER_AI["여"])
-    df["p_na"] = (df["sodium"] > SODIUM_CDRR).where(df["sodium"].notna())
-    df["p_cho"] = (df["cho_p"] > CHO_RANGE[1]).where(df["cho_p"].notna())
-    df["p_fat"] = (df["fat_p"] > FAT_RANGE[1]).where(df["fat_p"].notna())
-    df["p_sug"] = (df["sug_p"] > SUGAR_MAX).where(df["sug_p"].notna())
-    df["p_fib"] = (df["fiber"] < fib_ai).where(df["fiber"].notna())
-    for k in ("p_na", "p_cho", "p_fat", "p_sug", "p_fib"):
-        df[k] = df[k].astype(float)
+    flag = lambda cond, base: cond.where(base.notna()).astype(float)
+    df["p_en_hi"] = flag(df["en_eer"] > EN_HIGH, df["en_eer"])
+    df["p_en_lo"] = flag(df["en_eer"] < EN_LOW, df["en_eer"])
+    df["p_na"] = flag(df["sodium"] > df["na_lim"], df["sodium"])
+    df["p_cho"] = flag(df["cho_p"] > CHO_RANGE[1], df["cho_p"])
+    df["p_fat"] = flag(df["fat_p"] > FAT_RANGE[1], df["fat_p"])
+    df["p_sug"] = flag(df["sug_p"] > SUGAR_MAX, df["sug_p"])
+    df["p_fib"] = flag(df["fiber"] < df["fib_ai"], df["fiber"])
     return df
 
 
-# 영양판정 영역별 비교 지표: (열, 이름, 영역, 종류, 판정 기준에 쓰였는지)
+# A 건강 결과: 대사증후군 판정 기준 5개 (열, 이름, 기준)
+CRITERIA = [
+    ("m_waist", "복부비만", "허리둘레 남 90cm·여 85cm 이상"),
+    ("m_bp", "혈압 높음", "130/85mmHg 이상 또는 혈압약"),
+    ("m_glu", "공복혈당 높음", "100mg/dL 이상 또는 당뇨약·인슐린"),
+    ("m_tg", "중성지방 높음", "150mg/dL 이상"),
+    ("m_hdl", "HDL 낮음", "남 40·여 50mg/dL 미만"),
+]
+
+# B 식사·생활 판정: (열, 이름, 영역, 기준 설명)
+JUDGE = [
+    ("p_en_hi", "에너지 과잉 섭취", "식사", f"필요추정량의 {EN_HIGH}% 초과 (성별·나이별)"),
+    ("p_en_lo", "에너지 부족 섭취", "식사", f"필요추정량의 {EN_LOW}% 미만 (성별·나이별)"),
+    ("p_cho", "탄수화물 비율 높음", "식사", f"에너지의 {CHO_RANGE[1]}% 초과 (적정 {CHO_RANGE[0]}~{CHO_RANGE[1]}%)"),
+    ("p_fat", "지방 비율 높음", "식사", f"에너지의 {FAT_RANGE[1]}% 초과 (적정 {FAT_RANGE[0]}~{FAT_RANGE[1]}%)"),
+    ("p_sug", "당류 비율 높음", "식사", f"에너지의 {SUGAR_MAX}% 초과"),
+    ("p_na", "나트륨 기준 초과", "식사", "만성질환위험감소섭취량 초과 (나이별 2,300·2,100·1,700mg)"),
+    ("p_fib", "식이섬유 충분섭취량 미만", "식사", "남 30g(65세 이상 25g) · 여 20g 미만 · '부족' 판정은 아님"),
+    ("skip_bf", "아침 결식", "생활", "아침식사 주 2회 이하"),
+    ("eatout_d", "잦은 외식", "생활", "외식 하루 1회 이상"),
+    ("drink", "고위험음주", "생활", "주 2회 이상, 한 번에 남 7잔·여 5잔 이상"),
+    ("smoke", "현재 흡연", "생활", "평생 5갑 이상 피웠고 지금도 피움"),
+]
+
+# 상세 표 (그룹 평균 비교): (열, 이름, 영역, 종류, 판정 기준에 쓰였는지)
 INDICATORS = [
     ("bmi", "BMI (kg/m²)", "신체계측", "mean", False),
     ("obese", "비만 (BMI 25 이상)", "신체계측", "pct", False),
@@ -378,19 +488,55 @@ INDICATORS = [
     ("tc", "총콜레스테롤 (mg/dL)", "생화학 자료", "mean", False),
     ("sbp", "수축기 혈압 (mmHg)", "신체검사", "mean", True),
     ("energy", "에너지 섭취 (kcal)", "식사력", "mean", False),
+    ("en_eer", "에너지 섭취 (필요추정량 대비 %)", "식사력", "mean", False),
     ("cho_p", "탄수화물 에너지 비율 (%)", "식사력", "mean", False),
     ("fat_p", "지방 에너지 비율 (%)", "식사력", "mean", False),
     ("sug_p", "당류 에너지 비율 (%)", "식사력", "mean", False),
-    ("na_d", "나트륨 (mg/1,000kcal)", "식사력", "mean", False),
     ("sodium", "나트륨 (mg/일)", "식사력", "mean", False),
-    ("fib_d", "식이섬유 (g/1,000kcal)", "식사력", "mean", False),
+    ("fiber", "식이섬유 (g/일)", "식사력", "mean", False),
     ("skip_bf", "아침 결식 (주 2회 이하)", "생활습관", "pct", False),
     ("eatout_d", "외식 하루 1회 이상", "생활습관", "pct", False),
-    ("drink", "음주", "생활습관", "pct", False),
+    ("drink", "고위험음주", "생활습관", "pct", False),
     ("smoke", "현재 흡연", "생활습관", "pct", False),
     ("dm_dx", "당뇨 의사진단", "과거력", "pct", False),
     ("ht_dx", "고혈압 의사진단", "과거력", "pct", False),
 ]
+
+# C 관련성: 성별·나이 보정 로지스틱 회귀
+ENERGY_ADJ = {"p_na", "p_fib"}   # 하루 총량 기준이라 많이 먹는 사람일수록 해당하기 쉬워서 에너지 섭취량도 보정해요
+
+
+@st.cache_data(show_spinner="성별·나이를 보정해서 계산하고 있어요")
+def adjusted_or(df, case, keys):
+    """지표 하나씩: 대상 그룹(case) vs 정상 그룹을 결과로, 지표 + 나이(곡선) + 성별(+에너지)로 가중 로지스틱 회귀.
+    신뢰구간은 같은 조사구(psu) 사람끼리 비슷한 점을 반영한 군집 표준오차로 계산해요."""
+    sub = df if case == "중재 대상" else df[df["group"].isin([case, "정상"])]
+    use_psu = sub["psu"].notna().any()
+    rows = []
+    for key in keys:
+        need = [key, "age", "sex", "wt"] + (["energy"] if key in ENERGY_ADJ else []) + (["psu"] if use_psu else [])
+        d = sub.dropna(subset=need)
+        y = (d["group"] != "정상").astype(float) if case == "중재 대상" else (d["group"] == case).astype(float)
+        cells = pd.crosstab(y, d[key])
+        if len(d) < 100 or cells.shape != (2, 2) or cells.values.min() < 10:
+            continue
+        a = (d["age"] - 50) / 10
+        X = pd.DataFrame({"지표": d[key], "나이": a, "나이²": a ** 2, "여자": (d["sex"] == 2).astype(float)})
+        if key in ENERGY_ADJ:
+            X["에너지"] = d["energy"] / 1000
+        X = sm.add_constant(X)
+        model = sm.GLM(y, X, family=sm.families.Binomial(), var_weights=d["wt"] / d["wt"].mean())
+        with warnings.catch_warnings():   # 가중치+군집 표준오차 조합 경고: 직접 계산한 값과 같은 걸 확인했어요
+            warnings.simplefilter("ignore")
+            if use_psu:
+                res = model.fit(cov_type="cluster", cov_kwds={"groups": pd.factorize(d["psu"])[0]})
+            else:
+                res = model.fit(cov_type="HC1")
+        b, se = res.params["지표"], res.bse["지표"]
+        rows.append({"key": key, "OR": np.exp(b), "low": np.exp(b - 1.96 * se), "high": np.exp(b + 1.96 * se),
+                     "p": res.pvalues["지표"], "n": len(d)})
+    return pd.DataFrame(rows)
+
 
 # ================================================================ 진단 후보와 중재 내용
 # 원인(E) 후보로 볼 행동 변수
@@ -412,9 +558,10 @@ DX = {
     },
     "p_na": {
         "P": "나트륨 섭취 과다", "영역": "섭취", "지표": "sodium", "지표명": "나트륨 섭취량", "단위": "mg/일",
-        "기준": f"나트륨 {SODIUM_CDRR:,}mg/일 초과 (만성질환위험감소섭취량)", "E": "국·찌개·김치류와 외식 중심의 식사",
-        "E변수": ["eatout_d"], "측정": "24시간 회상법", "목표선": SODIUM_CDRR,
-        "제공": f"나트륨 하루 {SODIUM_CDRR:,}mg 이하",
+        "기준": "나트륨 만성질환위험감소섭취량 초과 (19~64세 2,300 · 65~74세 2,100 · 75세 이상 1,700mg/일)",
+        "E": "국·찌개·김치류와 외식 중심의 식사",
+        "E변수": ["eatout_d"], "측정": "24시간 회상법", "목표선": "na_lim",
+        "제공": "나트륨 하루 2,300mg 이하 (65~74세 2,100mg, 75세 이상 1,700mg)",
         "교육": ["국·찌개는 건더기 위주로 먹고 국물은 남겨요.",
                "김치·장아찌는 한 끼에 작은 접시 하나만 먹어요.",
                "라면은 스프를 절반만 넣고 국물은 마시지 않아요.",
@@ -460,10 +607,10 @@ DX = {
         "협의_키": "undx_dl", "협의": "총콜레스테롤 240 이상 또는 중성지방 200 이상인데 이상지질혈증 진단을 받지 않은 사람은 진료를 권해요.",
     },
     "p_fib": {
-        "P": "식이섬유 섭취 부족", "영역": "섭취", "지표": "fiber", "지표명": "식이섬유 섭취량", "단위": "g/일",
-        "기준": f"식이섬유 충분섭취량 미만 (남 {FIBER_AI['남']}g, 여 {FIBER_AI['여']}g · 2020 기준, 2025 개정값 확인)",
+        "P": "식이섬유 섭취 적음 (충분섭취량 미만)", "영역": "섭취", "지표": "fiber", "지표명": "식이섬유 섭취량", "단위": "g/일",
+        "기준": "식이섬유 충분섭취량 미만 (남 30g·65세 이상 25g, 여 20g). 충분섭취량은 평균필요량이 아니라서 '부족'이라고 판정할 수는 없어요",
         "E": "채소·잡곡·콩류가 적은 식사", "E변수": ["eatout_d", "skip_bf"], "측정": "24시간 회상법",
-        "제공": f"식이섬유 하루 남 {FIBER_AI['남']}g, 여 {FIBER_AI['여']}g 수준",
+        "제공": "식이섬유 하루 남 30g(65세 이상 25g), 여 20g 수준",
         "교육": ["끼니마다 채소 반찬을 두 가지 먹어요.",
                "흰밥 대신 잡곡밥을 먹어요.",
                "콩·두부를 주 3회 이상 먹어요.",
@@ -482,8 +629,8 @@ DX = {
         "협의_키": None, "협의": "교대근무처럼 생활 패턴 때문이라면 직장 보건관리자와 함께 방법을 찾아요.",
     },
     "drink": {
-        "P": "알코올 섭취 과다 의심", "영역": "섭취", "지표": "drink", "지표명": "음주 비율", "단위": "",
-        "기준": "주 2회 이상 음주 (빈도만 있어 양은 상담에서 확인)", "E": "잦은 회식·술자리", "E변수": ["eatout_d"], "측정": "건강 설문",
+        "P": "알코올 섭취 과다 (고위험음주)", "영역": "섭취", "지표": "drink", "지표명": "고위험음주 비율", "단위": "",
+        "기준": "주 2회 이상, 한 번에 남 7잔·여 5잔 이상 (국민건강통계 고위험음주 정의)", "E": "잦은 회식·술자리", "E변수": ["eatout_d"], "측정": "건강 설문",
         "제공": "음주 횟수를 주 1회 이하로, 한 번에 마시는 양도 줄이기",
         "교육": ["빈속에 마시지 않도록 술자리 전에 식사를 해요.",
                "안주는 튀김·찌개 대신 두부·생선구이·채소로 골라요.",
@@ -509,12 +656,15 @@ def diagnose(df):
     return pd.DataFrame(rows)
 
 
-def pick_top(tab, k=3, floor=0.2):
-    """공통 처방(비만)은 따로 두고, 나머지 중 대상 그룹 해당 비율 20% 이상 · 정상보다 높은 것을 차이 순으로 k개."""
+MIN_DIFF = 0.05   # 정상 그룹보다 5%p 이상 높아야 '이 집단의 문제'로 봐요
+
+
+def pick_top(tab, k=3, floor=0.2, gap=MIN_DIFF):
+    """공통 처방(비만)은 따로 두고, 나머지 중 대상 그룹 해당 비율 20% 이상 · 정상보다 5%p 이상 높은 것을 차이 순으로 k개."""
     if tab.empty:
         return [], []
     common = tab[tab["공통"] & (tab["중재 대상"] >= floor) & (tab["차이"] > 0)]["key"].tolist()
-    rest = tab[~tab["공통"] & (tab["중재 대상"] >= floor) & (tab["차이"] > 0)].sort_values("차이", ascending=False)
+    rest = tab[~tab["공통"] & (tab["중재 대상"] >= floor) & (tab["차이"] >= gap)].sort_values("차이", ascending=False)
     return common, rest["key"].head(k).tolist()
 
 
@@ -540,7 +690,7 @@ def pes_text(df, key):
             continue
         a_, b_ = wmean(df.loc[yes, b], w[yes]), wmean(df.loc[no, b], w[no])
         if a_ > b_:
-            label = E_BEHAV[b] if b != "drink" else "음주"
+            label = E_BEHAV[b] if b != "drink" else meta.get("drink_label", "음주")
             ev.append(f"해당자 중 {label} {a_:.1%} (비해당자 {b_:.1%})")
     return s, ev
 
@@ -596,7 +746,9 @@ for n_ in notes:
 
 df = add_status(data)
 if meta.get("drink_label") == "음주함":
-    DX["drink"].update({"P": "음주 (양·빈도는 상담에서 확인)", "기준": "음주 여부 (빈도·양 정보 없음)"})
+    DX["drink"].update({"P": "음주 (양·빈도는 상담에서 확인)", "기준": "음주 여부 (빈도·양 정보 없음)", "지표명": "음주 비율"})
+elif meta.get("drink_label") == "주 2회 이상 음주":
+    DX["drink"].update({"P": "잦은 음주 (양은 상담에서 확인)", "기준": "주 2회 이상 음주 (한 번 음주량 정보 없음)", "지표명": "잦은 음주 비율"})
 has_dx = df[["dm_dx", "ht_dx"]].notna().any().any()
 if has_dx:
     excl = st.toggle("이미 진단받은 사람(당뇨·고혈압·이상지질혈증) 빼고 보기", value=False,
@@ -615,67 +767,142 @@ t1, t2, t3, t4 = st.tabs(["① 영양판정", "② 영양진단", "③ 영양중
 
 # ---------------------------------------------------------------- ① 영양판정
 with t1:
-    st.subheader("누가, 어떤 상태인가")
+    st.subheader("이 집단은 지금 어떤 상태인가")
+    st.write("영양판정은 세 단계로 봐요. **A** 건강 결과로 누가 얼마나 문제인지 보고, **B** 식사·생활을 섭취기준과 비교하고, "
+             "**C** 성별·나이를 맞춘 뒤에도 대사증후군과 관련 있는 요인을 찾아요. B와 C는 ② 영양진단에서 문제를 고르는 근거가 돼요.")
+
+    # ---------- A 건강 결과
+    st.markdown("#### A. 건강 결과 · 누가, 얼마나")
     shares = {g_: wmean((df["group"] == g_).astype(float), w) for g_ in GROUPS}
     counts = df["group"].value_counts()
     cols = st.columns(4)
     cols[0].metric("분석 인원 (성인)", f"{len(df):,}명")
-    for c_, g_ in zip(cols[1:], GROUPS):
-        c_.metric(f"{g_} ({counts.get(g_, 0):,}명)", f"{shares[g_]:.1%}")
-    st.caption("대사증후군 기준 5개(허리둘레, 중성지방, HDL, 혈압, 공복혈당) 중 해당 개수로 나눴어요. "
-               "0개 정상 · 1~2개 위험군(예방 중재) · 3개 이상 대사증후군(집중 중재). "
-               "혈압약·혈당약을 먹고 있으면 해당 항목에 해당하는 것으로 셌어요.")
+    for c_, g_, lab in zip(cols[1:], GROUPS, ["기준 0개", "기준 1~2개 · 예방 대상", "기준 3개 이상 · 관리 대상"]):
+        c_.metric(f"{g_} ({counts.get(g_, 0):,}명)", f"{shares[g_]:.1%}", help=lab)
+    st.caption("대사증후군 판정 기준 5개 중 몇 개에 해당하는지로 나눴어요. 0개 정상 · 1~2개 위험군(예방 대상) · 3개 이상 대사증후군(관리 대상). "
+               "여기서 '정상'은 5개 기준에 해당하지 않는다는 뜻이지 건강하다는 뜻은 아니에요.")
 
-    fig = go.Figure(go.Bar(x=[shares[g_] for g_ in GROUPS], y=GROUPS, orientation="h",
-                           marker_color=[COLORS[g_] for g_ in GROUPS],
-                           text=[f"{shares[g_]:.1%}" for g_ in GROUPS], textposition="outside"))
-    fig.update_layout(height=200, margin=dict(t=10, b=10, l=10, r=40), xaxis_tickformat=".0%",
-                      xaxis_range=[0, max(shares.values()) * 1.2], yaxis_autorange="reversed")
-    st.plotly_chart(fig, width="stretch")
+    a1, a2 = st.columns(2)
+    with a1:
+        fig = go.Figure(go.Bar(x=[shares[g_] for g_ in GROUPS], y=GROUPS, orientation="h",
+                               marker_color=[COLORS[g_] for g_ in GROUPS],
+                               text=[f"{shares[g_]:.1%}" for g_ in GROUPS], textposition="outside"))
+        fig.update_layout(title="그룹 분포", height=230, margin=dict(t=40, b=10, l=10, r=40), xaxis_tickformat=".0%",
+                          xaxis_range=[0, max(shares.values()) * 1.25], yaxis_autorange="reversed")
+        st.plotly_chart(fig, width="stretch")
+    with a2:
+        crit = pd.DataFrame([{"항목": name, "기준": rule, "해당": wmean(df[col].astype(float), w)} for col, name, rule in CRITERIA])
+        crit = crit.sort_values("해당")
+        fig = go.Figure(go.Bar(x=crit["해당"], y=crit["항목"], orientation="h", marker_color="#8C6BB1",
+                               text=[f"{v:.1%}" for v in crit["해당"]], textposition="outside",
+                               customdata=crit["기준"], hovertemplate="%{y}: %{x:.1%}<br>기준: %{customdata}<extra></extra>"))
+        fig.update_layout(title="판정 기준별 해당 비율 (성인 전체)", height=230, margin=dict(t=40, b=10, l=10, r=40),
+                          xaxis_tickformat=".0%", xaxis_range=[0, crit["해당"].max() * 1.3])
+        st.plotly_chart(fig, width="stretch")
 
-    st.markdown("**영양판정 5개 영역으로 그룹 비교**")
+    with st.expander("혈당 단계 자세히 보기 (국민건강통계 당뇨 정의)"):
+        stage = {s_: wmean((df["glu_stage"] == s_).astype(float), w) for s_ in ["정상", "당뇨 전단계", "당뇨"]}
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("혈당 정상", f"{stage['정상']:.1%}")
+        c2.metric("당뇨 전단계", f"{stage['당뇨 전단계']:.1%}", help="공복혈당 100~125 또는 당화혈색소 5.7~6.4%")
+        c3.metric("당뇨", f"{stage['당뇨']:.1%}", help="공복혈당 126 이상, 당화혈색소 6.5% 이상, 의사진단, 당뇨약·인슐린 중 하나")
+        if df["dm_dx"].notna().any():
+            c4.metric("수치는 높은데 진단 없음", f"{int(df['undx_dm'].sum()):,}명", help="③ 영양중재의 다분야 협의(진료 연계) 대상이에요")
+        if df["hba1c"].isna().all():
+            st.caption("당화혈색소·진단·약 정보가 없으면 공복혈당만으로 판정해서, 공복혈당은 정상인 당뇨인을 놓쳐요.")
+
+    # ---------- B 식사·생활 판정
+    st.markdown("#### B. 식사·생활 판정 · 섭취기준과 비교")
     rows = []
-    for col, name, area, kind, used in INDICATORS:
+    for col, name, area, rule in JUDGE:
         x = df[col]
         if n_known(x) < 30:
             continue
-        row = {"영역": area, "지표": name + (" ·판정 기준" if used else "")}
+        row = {"영역": area, "항목": name, "판정 기준": rule, "성인 전체": wmean(x, w)}
         for g_ in GROUPS:
             m = df["group"] == g_
-            row[g_] = "가림" if 0 < n_known(x[m]) < 5 else fmt(wmean(x[m], w[m]), kind)
-        row["효과크기"] = smd(x, w, df["group"] == "대사증후군", df["group"] == "정상")
+            row[g_] = np.nan if n_known(x[m]) < 5 else wmean(x[m], w[m])
         rows.append(row)
-    comp = pd.DataFrame(rows)
-    st.dataframe(comp, width="stretch", hide_index=True,
-                 column_config={"효과크기": st.column_config.NumberColumn(format="%.2f",
-                                help="대사증후군 그룹과 정상 그룹의 표준화 평균 차이. 0.2 작음 · 0.5 중간 · 0.8 큼")})
-    st.caption("식사 지표는 에너지 보정 값(1,000kcal당, 에너지 비율)을 함께 봐요. 많이 먹는 사람이 모든 영양소를 많이 먹는 효과를 빼야 그룹을 공정하게 비교할 수 있어요. "
-               "'식사력'이 비어 있으면 식사 자료가 없는 데이터예요.")
+    if rows:
+        judge = pd.DataFrame(rows)
+        if meta.get("drink_label") != "고위험음주":
+            rule = "주 2회 이상 (한 번 음주량 정보가 없어 빈도로만 판정)" if meta.get("drink_label") == "주 2회 이상 음주" else "음주 여부 (빈도·양 정보 없음)"
+            judge.loc[judge["항목"] == "고위험음주", ["항목", "판정 기준"]] = [meta.get("drink_label", "음주"), rule]
+        for c_ in ["성인 전체"] + GROUPS:
+            judge[c_] = judge[c_] * 100
+        pct = st.column_config.NumberColumn(format="%.1f%%")
+        st.dataframe(judge, width="stretch", hide_index=True, height=35 * (len(judge) + 1) + 3,
+                     column_config={"판정 기준": st.column_config.TextColumn(width="large"),
+                                    "성인 전체": pct, "정상": pct, "위험군": pct, "대사증후군": pct})
+        st.caption(f"숫자는 기준에 해당하는 사람의 비율이에요. 기준은 국건영 제9기가 쓰는 {KDRI_NAME}이고, 성별·나이별 값을 사람마다 따로 적용했어요. "
+                   "24시간 회상법은 하루치 기록이라 '평소에 기준을 넘는 사람'보다 높게 나올 수 있어요. "
+                   "식이섬유 충분섭취량은 평균필요량이 아니라서, 미만이어도 '부족'이라고 판정하지는 않아요.")
+        if not has_diet:
+            st.info("식사 자료가 없어 식사 항목은 빠졌어요. 국건영 영양조사 자료를 올리면 나타나요.")
+    else:
+        st.info("식사·생활 자료가 없어 이 단계를 건너뛰어요.")
 
-    st.markdown("**바꿀 수 있는 요인 중 차이가 큰 순서**")
-    rank = comp[comp["영역"].isin(["신체계측", "식사력", "생활습관"]) & ~comp["지표"].str.contains("판정 기준")
-                & ~comp["지표"].isin(["나트륨 (mg/일)", "에너지 섭취 (kcal)"])].dropna(subset=["효과크기"])
-    rank = rank.reindex(rank["효과크기"].abs().sort_values().index)
-    if len(rank):
-        fig = go.Figure(go.Bar(x=rank["효과크기"], y=rank["지표"], orientation="h",
-                               marker_color=np.where(rank["효과크기"] > 0, "#C8553D", "#4C9F70")))
-        fig.add_vline(x=0, line_color="#888")
-        fig.update_layout(height=40 + 30 * len(rank), margin=dict(t=10, b=10, l=10, r=10), xaxis_title="효과크기 (대사증후군 − 정상)")
+    # ---------- C 관련성
+    st.markdown("#### C. 관련성 · 성별·나이를 맞춰도 남는 차이")
+    st.write("B에서 그룹 간 차이가 나도 나이 차이 때문일 수 있어요. 대사증후군 그룹이 정상 그룹보다 평균 나이가 훨씬 많거든요. "
+             "그래서 같은 성별·나이끼리 비교했을 때도 차이가 남는지 봐요.")
+    age_gap = {g_: wmean(df.loc[df["group"] == g_, "age"], w[df["group"] == g_]) for g_ in GROUPS}
+    st.caption("그룹별 평균 나이: " + " · ".join(f"{g_} {age_gap[g_]:.1f}세" for g_ in GROUPS))
+    case = st.radio("어느 그룹을 정상 그룹과 비교할까", ["대사증후군", "위험군"], horizontal=True,
+                    format_func=lambda g_: f"{g_} vs 정상" + (" (관리 대상)" if g_ == "대사증후군" else " (예방 대상)"))
+    keys = [col for col, *_ in JUDGE if n_known(df[col]) >= 30]
+    ors = adjusted_or(df, case, keys) if keys else pd.DataFrame()
+    st.session_state["or_table"] = ors
+    if ors.empty:
+        st.info("보정 분석을 하기에 자료가 부족해요.")
+    else:
+        names = {col: name for col, name, *_ in JUDGE}
+        if meta.get("drink_label") != "고위험음주":
+            names["drink"] = meta.get("drink_label", "음주")
+        ors = ors.assign(이름=ors["key"].map(names), 확실=(ors["low"] > 1) | (ors["high"] < 1)).sort_values("OR")
+        color = np.where(~ors["확실"], "#A0A0A0", np.where(ors["OR"] > 1, "#C8553D", "#4C9F70"))
+        fig = go.Figure(go.Scatter(
+            x=ors["OR"], y=ors["이름"], mode="markers", marker=dict(size=11, color=color),
+            error_x=dict(type="data", symmetric=False, array=ors["high"] - ors["OR"], arrayminus=ors["OR"] - ors["low"], color="#888"),
+            hovertemplate="%{y}<br>오즈비 %{x:.2f}<extra></extra>"))
+        fig.add_vline(x=1, line_dash="dash", line_color="#666")
+        fig.update_layout(height=60 + 34 * len(ors), margin=dict(t=10, b=40, l=10, r=10), xaxis_type="log",
+                          xaxis_title=f"오즈비 (95% 신뢰구간) · 1보다 크면 {case} 그룹과 관련 높음")
         st.plotly_chart(fig, width="stretch")
-        st.caption("판정 기준 5개(허리·혈압·혈당·중성지방·HDL)는 그룹을 나눈 기준이라 차이가 큰 게 당연해서 순위에서 뺐어요. "
-                   "빨간 막대는 대사증후군 그룹에서 더 높고, 초록 막대는 더 낮아요. 같은 날 잰 자료라 원인이 아니라 함께 나타나는 관계예요.")
+        st.caption("빨간 점: 해당하는 사람이 같은 성별·나이의 비해당자보다 " + case + " 그룹일 가능성이 높아요. "
+                   "초록 점: 낮아요. 회색 점: 신뢰구간이 1을 걸쳐서 차이가 있다고 말하기 어려워요.")
+        with st.expander("숫자로 보기 · 오즈비 읽는 법"):
+            tbl = ors[["이름", "OR", "low", "high", "p", "n"]].rename(columns={"이름": "항목", "OR": "오즈비", "low": "95% 하한", "high": "95% 상한", "p": "p값", "n": "분석 인원"})
+            st.dataframe(tbl.sort_values("오즈비", ascending=False), width="stretch", hide_index=True, height=35 * (len(tbl) + 1) + 3,
+                         column_config={c_: st.column_config.NumberColumn(format="%.2f") for c_ in ["오즈비", "95% 하한", "95% 상한"]}
+                         | {"p값": st.column_config.NumberColumn(format="%.3f")})
+            st.markdown(md(
+                "- **오즈비 1.5**: 성별·나이가 같을 때, 그 항목에 해당하는 사람은 해당하지 않는 사람보다 "
+                f"{case} 그룹일 오즈가 1.5배라는 뜻이에요.\n"
+                "- **95% 신뢰구간**이 1을 포함하지 않으면 우연으로 보기 어려운 차이예요.\n"
+                "- 나트륨과 식이섬유는 하루 총량 기준이라 많이 먹는 사람일수록 해당하기 쉬워서, 에너지 섭취량도 함께 맞췄어요.\n"
+                "- 가중치를 반영했고, 같은 조사구 사람끼리 비슷한 점을 고려해 신뢰구간을 넓게 잡았어요 (층 정보까지 쓰는 정식 복합표본 분석보다 조금 보수적).\n"
+                "- 비만(BMI)은 판정 기준인 허리둘레와 거의 같이 움직여서 여기서 뺐어요."))
+        st.warning("같은 날 조사한 단면 자료라 원인이 아니라 **관련성**이에요. 이미 진단받고 식사를 바꾼 사람이 섞이면 방향이 거꾸로 나올 수 있어요 "
+                   "(예: 당류를 줄인 당뇨 환자). 위의 '진단받은 사람 빼고 보기'를 켜서 결과가 유지되는지 확인해 보세요.")
 
-    st.markdown("**혈당 단계** · 국민건강통계 당뇨 정의")
-    stage = {s_: wmean((df["glu_stage"] == s_).astype(float), w) for s_ in ["정상", "당뇨 전단계", "당뇨"]}
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("혈당 정상", f"{stage['정상']:.1%}")
-    c2.metric("당뇨 전단계", f"{stage['당뇨 전단계']:.1%}", help="공복혈당 100~125 또는 당화혈색소 5.7~6.4%")
-    c3.metric("당뇨", f"{stage['당뇨']:.1%}", help="공복혈당 126 이상, 당화혈색소 6.5% 이상, 의사진단, 혈당강하제·인슐린 중 하나")
-    if df["dm_dx"].notna().any():
-        c4.metric("수치는 높은데 진단 없음", f"{int(df['undx_dm'].sum()):,}명", help="③ 영양중재의 다분야 협의(진료 연계) 대상이에요")
-    if df["hba1c"].isna().all():
-        st.caption("당화혈색소·진단·약 정보가 없으면 공복혈당만으로 판정해서, 공복혈당은 정상인 당뇨인을 놓쳐요.")
-    st.caption("당뇨 전단계는 영양 중재로 진행을 늦출 수 있는 핵심 대상이에요.")
+    with st.expander("상세 표 · 그룹별 평균 비교"):
+        rows = []
+        for col, name, area, kind, used in INDICATORS:
+            x = df[col]
+            if n_known(x) < 30:
+                continue
+            row = {"영역": area, "지표": name + (" ·판정 기준" if used else "")}
+            for g_ in GROUPS:
+                m = df["group"] == g_
+                row[g_] = "가림" if 0 < n_known(x[m]) < 5 else fmt(wmean(x[m], w[m]), kind)
+            row["효과크기"] = smd(x, w, df["group"] == "대사증후군", df["group"] == "정상")
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True,
+                     column_config={"효과크기": st.column_config.NumberColumn(format="%.2f",
+                                    help="(대사증후군 평균 − 정상 평균) ÷ 표준편차. 단위가 다른 지표의 차이 크기를 같은 잣대로 보는 값이에요. 0.2 작음 · 0.5 중간 · 0.8 큼")})
+        st.caption("판정 기준이 붙은 지표는 그룹을 나눈 기준이라 차이가 큰 게 당연해요. 이 표는 나이 보정 전 단순 비교라서 결론은 C를 기준으로 봐요. "
+                   "식사 지표의 효과크기는 하루치 기록의 날마다 변동 때문에 실제보다 작게 나오는 경향이 있어요.")
 
 # ---------------------------------------------------------------- ② 영양진단
 with t2:
@@ -687,11 +914,23 @@ with t2:
     else:
         show = dx_tab.copy().sort_values(["공통", "차이"], ascending=[False, False])
         show["선택"] = show["key"].map(lambda k: "공통 처방" if k in common_keys else ("상위 3" if k in top_keys else ""))
-        st.dataframe(show[["P", "영역", "중재 대상", "정상", "차이", "선택"]], width="stretch", hide_index=True,
-                     column_config={"중재 대상": st.column_config.NumberColumn("중재 대상 그룹 해당", format="percent"),
-                                    "정상": st.column_config.NumberColumn("정상 그룹 해당", format="percent"),
-                                    "차이": st.column_config.NumberColumn("차이 (%p)", format="percent")})
-        st.caption("중재 대상 그룹 = 위험군 + 대사증후군. 고르는 규칙: 중재 대상 그룹에서 해당 비율이 20% 이상이고 정상 그룹보다 높은 것 중 차이가 큰 3개. "
+        or_keys = [k for k in show["key"] if k != "obese"]
+        or_dx = adjusted_or(df, "중재 대상", or_keys) if or_keys else pd.DataFrame()
+        if not or_dx.empty:
+            or_txt = {r_.key: f"{r_.OR:.2f} ({r_.low:.2f}~{r_.high:.2f})" + (" *" if (r_.low > 1 or r_.high < 1) else "") for r_ in or_dx.itertuples()}
+            show["보정 오즈비"] = show["key"].map(or_txt).fillna("-")
+        else:
+            show["보정 오즈비"] = "-"
+        for c_ in ["중재 대상", "정상", "차이"]:
+            show[c_] = show[c_] * 100
+        st.dataframe(show[["P", "영역", "중재 대상", "정상", "차이", "보정 오즈비", "선택"]], width="stretch", hide_index=True,
+                     column_config={"중재 대상": st.column_config.NumberColumn("중재 대상 그룹 해당", format="%.1f%%"),
+                                    "정상": st.column_config.NumberColumn("정상 그룹 해당", format="%.1f%%"),
+                                    "차이": st.column_config.NumberColumn("차이 (%p)", format="%+.1f"),
+                                    "보정 오즈비": st.column_config.TextColumn("성별·나이 보정 오즈비 (95% CI)",
+                                        help="① 영양판정 C와 같은 방법. 중재 대상 그룹(위험군+대사증후군) vs 정상. *는 신뢰구간이 1을 포함하지 않음")})
+        st.caption("중재 대상 그룹 = 위험군 + 대사증후군. 고르는 규칙: 중재 대상 그룹에서 해당 비율이 20% 이상이고 정상 그룹보다 5%p 이상 높은 것 중 차이가 큰 3개. "
+                   "자동 선택은 아직 나이 보정 전 차이로 해요. 보정 오즈비가 1 근처인 문제는 나이 차이 때문일 수 있으니 고를 때 함께 보세요. "
                    "과체중·비만은 대부분에게 공통인 기본 처방으로 따로 둬요.")
         if not has_diet:
             st.info("식사 자료가 없어 섭취·행동 영역 진단은 계산하지 않았어요. 국건영 영양조사 자료를 올리면 나타나요.")
@@ -776,9 +1015,11 @@ with t4:
             eff.append({"영양진단": d["P"], "가정": "BMI 25 이상인 사람이 체중 5% 감량", "지표": "비만 비율",
                         "지금": f"{before:.1%}", "가정 후": f"{after:.1%}"})
         elif "목표선" in d and x.notna().sum() >= 30:
-            capped = x.clip(upper=d["목표선"])
+            line = df[d["목표선"]] if isinstance(d["목표선"], str) else d["목표선"]
+            capped = x.clip(upper=line)
             before, after = wmean(x[tgt], w[tgt]), wmean(capped[tgt], w[tgt])
-            eff.append({"영양진단": d["P"], "가정": f"기준 초과자가 {d['목표선']:,}{d['단위']}까지 줄임",
+            line_txt = "자기 나이의 기준" if isinstance(d["목표선"], str) else f"{d['목표선']:,}{d['단위']}"
+            eff.append({"영양진단": d["P"], "가정": f"기준 초과자가 {line_txt}까지 줄임",
                         "지표": f"그룹 평균 {d['지표명']}", "지금": f"{before:,.1f}{d['단위']}", "가정 후": f"{after:,.1f}{d['단위']}"})
     if eff:
         st.dataframe(pd.DataFrame(eff), width="stretch", hide_index=True)
