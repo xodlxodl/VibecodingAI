@@ -51,6 +51,9 @@ FIELDS = {
     "smoke": ("현재 흡연 상태", False), "smoke_life": ("평생 흡연량 (5갑 이상 여부)", False),
     "drink": ("음주 빈도 (또는 Y/N)", False), "drink_amt": ("한 번 음주량", False),
     "breakfast": ("아침식사 빈도", False), "eatout": ("외식 빈도", False),
+    "pa": ("유산소 신체활동 실천 (0/1)", False), "income": ("가구 소득 4분위", False), "edu": ("교육수준 (1~4)", False),
+    "town": ("동/읍면", False), "cfam": ("가구원 수", False), "nedu": ("영양교육·상담 경험", False),
+    "label_co": ("영양표시 인지", False), "label_us": ("영양표시 이용", False),
     "energy": ("에너지 섭취량 (kcal)", False), "prot": ("단백질 (g)", False), "cho": ("탄수화물 (g)", False), "fat": ("지방 (g)", False),
     "sugar": ("당류 (g)", False), "fiber": ("식이섬유 (g)", False), "sodium": ("나트륨 (mg)", False),
     "wt": ("가중치 (없으면 표본 기준)", False),
@@ -85,6 +88,14 @@ ALIASES = {
     "drink_amt": ["bd21", "한번음주량", "음주량"],
     "breakfast": ["lbrfq", "아침식사빈도", "아침식사"],
     "eatout": ["loutfq", "외식빈도", "외식"],
+    "pa": ["paaerobic", "유산소신체활동"],
+    "income": ["hoincm", "incm", "소득4분위", "소득"],
+    "edu": ["edu", "교육수준"],
+    "town": ["townt", "동읍면"],
+    "cfam": ["cfam", "가구원수"],
+    "nedu": ["lkedu", "영양교육경험"],
+    "label_co": ["lklbco", "영양표시인지"],
+    "label_us": ["lklbus", "영양표시이용"],
     "energy": ["nen", "energy", "에너지", "열량"],
     "prot": ["nprot", "단백질"],
     "cho": ["ncho", "탄수화물"],
@@ -243,6 +254,20 @@ def build_data(raw, mapping):
     out["skip_bf"] = num("breakfast").map({1: 0, 2: 0, 3: 1, 4: 1}).astype(float) if mapping.get("breakfast") else np.nan
     # 외식 빈도(L_OUT_FQ): 1=하루 2회 이상, 2=하루 1회 → 하루 1회 이상을 잦은 외식으로
     out["eatout_d"] = num("eatout").map({1: 1, 2: 1, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}).astype(float) if mapping.get("eatout") else np.nan
+    # 원인(E) 분석용 생활·사회경제 요인 (국건영 코드 기준, 9=모름은 빈칸)
+    opt = lambda k, f: f(num(k)).astype(float) if mapping.get(k) else np.nan
+    out["inactive"] = opt("pa", lambda x: x.map({0: 1, 1: 0}))
+    out["low_inc"] = opt("income", lambda x: x.map({1: 1, 2: 0, 3: 0, 4: 0}))
+    out["low_edu"] = opt("edu", lambda x: x.map({1: 1, 2: 1, 3: 0, 4: 0}))
+    out["rural"] = opt("town", lambda x: x.map({1: 0, 2: 1}))
+    out["alone"] = opt("cfam", lambda x: (x == 1).where(x.notna()))
+    out["no_nedu"] = opt("nedu", lambda x: x.map({1: 0, 2: 1}))
+    if mapping.get("label_us"):
+        us = num("label_us")
+        co = num("label_co") if mapping.get("label_co") else pd.Series(np.nan, index=raw.index)
+        out["no_label"] = us.map({1: 0, 2: 1, 8: 1}).astype(float).where(~((us == 8) & (co == 9)))
+    else:
+        out["no_label"] = np.nan
 
     bad = 0
     for k, (lo, hi) in VALID.items():
@@ -302,15 +327,19 @@ def simulate(n=6000, seed=11):
     smoke = np.where(male == 1, r.choice([1, 2, 3, 8], n, p=[0.3, 0.04, 0.4, 0.26]), r.choice([1, 2, 3, 8], n, p=[0.05, 0.02, 0.06, 0.87]))
     drink = np.where(male == 1, r.choice([1, 2, 3, 4, 5, 6], n, p=[0.15, 0.1, 0.1, 0.25, 0.25, 0.15]), r.choice([1, 2, 3, 4, 5, 6], n, p=[0.3, 0.2, 0.15, 0.2, 0.1, 0.05]))
     freq = (drink >= 5).astype(int)
+    inactive = (r.random(n) < 0.45 + 0.1 * a).astype(int)
+    label_use = (r.random(n) < np.clip(0.45 - 0.12 * a - 0.1 * male, 0.05, 0.9)).astype(int)
+    low_inc = (r.random(n) < np.clip(0.2 + 0.1 * a, 0.05, 0.6)).astype(int)
 
     energy = np.clip(np.where(male == 1, 2250, 1650) - 120 * a + 180 * out_d + np.where(male == 1, 650, 480) * g(), 400, 5500)
     cho_p = np.clip(61 + 4 * a - 2 * out_d + 8 * g(), 30, 85)
     fat_p = np.clip(22 - 3 * a + 3 * out_d + 6.5 * g(), 5, 50)
     sug_p = np.clip(13 - 1 * a + 1.5 * (bf >= 3) + 6 * g(), 2, 45)
-    na_dens = np.clip(1.6 + 0.25 * out_d + 0.1 * a + 0.35 * g(), 0.5, 4)        # mg/kcal
+    na_dens = np.clip(1.6 + 0.25 * out_d + 0.1 * a + 0.12 * (1 - label_use) + 0.08 * low_inc + 0.35 * g(), 0.5, 4)        # mg/kcal
     fib_dens = np.clip(13 + 2 * a - 1.5 * out_d + 3.5 * g(), 3, 35)             # g/1000kcal
 
-    bmi = np.clip(23.4 + 1.0 * male + 0.4 * a - 0.35 * a ** 2 + 0.06 * (sug_p - 13) + 0.05 * (fat_p - 22) + 0.4 * out_d + 3.1 * g(), 15, 45)
+    bmi = np.clip(23.4 + 1.0 * male + 0.4 * a - 0.35 * a ** 2 + 0.06 * (sug_p - 13) + 0.05 * (fat_p - 22) + 0.4 * out_d + 0.7 * inactive
+                  + 0.25 * (energy - 2000) / 500 + 3.1 * g(), 15, 45)
     waist = np.clip(np.where(male == 1, 2.5 * bmi + 25, 2.35 * bmi + 22) + 1.5 * a + 4 * g(), 55, 140)
     sbp = np.clip(116 + 6 * a + 1.2 * (bmi - 23.5) + 5 * male + 3.5 * (na_dens - 1.6) + 2 * freq + 12 * g(), 85, 220)
     dbp = np.clip(75 + 1.5 * a + 0.7 * (bmi - 23.5) + 4 * male + 0.15 * (sbp - 120) + 8 * g(), 45, 130)
@@ -359,7 +388,12 @@ def simulate(n=6000, seed=11):
         "N_SUGAR": (energy * sug_p / 100 / 4).round(1), "N_TDF": (energy * fib_dens / 1000).round(1),
         "N_NA": (energy * na_dens).round(), "wt_tot": np.round(np.exp(np.log(7000) + 0.5 * g()) * np.where(age > 65, 0.8, 1.0)),
         "kstrata": r.integers(1, 28, n),
+        "pa_aerobic": np.where(r.random(n) < 0.08, np.nan, 1 - inactive), "ho_incm": np.where(low_inc == 1, 1, r.choice([2, 3, 4], n)),
+        "edu": np.where(age > 65, r.choice([1, 2, 3, 4], n, p=[0.45, 0.2, 0.25, 0.1]), r.choice([1, 2, 3, 4], n, p=[0.03, 0.05, 0.37, 0.55])),
+        "town_t": np.where(r.random(n) < 0.18, 2, 1), "cfam": r.choice([1, 2, 3, 4, 5], n, p=[0.18, 0.35, 0.22, 0.18, 0.07]),
+        "LK_EDU": np.where(r.random(n) < 0.06, 1, 2), "LK_LB_CO": np.where(label_use == 1, 1, np.where(r.random(n) < 0.3, 2, 1)),
     })
+    df["LK_LB_US"] = np.where(df["LK_LB_CO"] == 2, 8, np.where(label_use == 1, 1, 2))
     df["psu"] = df["kstrata"] * 10 + r.integers(0, 7, n)
     lab_miss = r.random(n) < 0.04
     df.loc[lab_miss, ["HE_TG", "HE_HDL_st2", "HE_chol", "HE_HbA1c"]] = np.nan
@@ -506,41 +540,78 @@ INDICATORS = [
 ENERGY_ADJ = {"p_na", "p_fib"}   # 하루 총량 기준이라 많이 먹는 사람일수록 해당하기 쉬워서 에너지 섭취량도 보정해요
 
 
+OR_COLS = ["key", "OR", "low", "high", "p", "n"]
+
+
 @st.cache_data(show_spinner="성별·나이를 보정해서 계산하고 있어요")
-def adjusted_or(df, case, keys):
-    """지표 하나씩: 대상 그룹(case) vs 정상 그룹을 결과로, 지표 + 나이(곡선) + 성별(+에너지)로 가중 로지스틱 회귀.
+def assoc_or(d, outcome, keys, energy_keys=()):
+    """결과(outcome, 0/1 열)와 요인 하나씩의 관련성: 요인 + 나이(곡선) + 성별 (+에너지)로 가중 로지스틱 회귀.
     신뢰구간은 같은 조사구(psu) 사람끼리 비슷한 점을 반영한 군집 표준오차로 계산해요."""
-    sub = df if case == "중재 대상" else df[df["group"].isin([case, "정상"])]
-    use_psu = sub["psu"].notna().any()
+    use_psu = d["psu"].notna().any()
     rows = []
     for key in keys:
-        need = [key, "age", "sex", "wt"] + (["energy"] if key in ENERGY_ADJ else []) + (["psu"] if use_psu else [])
-        d = sub.dropna(subset=need)
-        y = (d["group"] != "정상").astype(float) if case == "중재 대상" else (d["group"] == case).astype(float)
-        cells = pd.crosstab(y, d[key])
-        if len(d) < 100 or cells.shape != (2, 2) or cells.values.min() < 10:
+        if key == outcome:
             continue
-        a = (d["age"] - 50) / 10
-        X = pd.DataFrame({"지표": d[key], "나이": a, "나이²": a ** 2, "여자": (d["sex"] == 2).astype(float)})
-        if key in ENERGY_ADJ:
-            X["에너지"] = d["energy"] / 1000
+        need = [outcome, key, "age", "sex", "wt"] + (["energy"] if key in energy_keys else []) + (["psu"] if use_psu else [])
+        dd = d.dropna(subset=need)
+        y = dd[outcome].astype(float)
+        cells = pd.crosstab(y, dd[key])
+        if len(dd) < 100 or cells.shape != (2, 2) or cells.values.min() < 10:
+            continue
+        a = (dd["age"] - 50) / 10
+        X = pd.DataFrame({"지표": dd[key].astype(float), "나이": a, "나이²": a ** 2, "여자": (dd["sex"] == 2).astype(float)})
+        if key in energy_keys:
+            X["에너지"] = dd["energy"] / 1000
         X = sm.add_constant(X)
-        model = sm.GLM(y, X, family=sm.families.Binomial(), var_weights=d["wt"] / d["wt"].mean())
+        model = sm.GLM(y, X, family=sm.families.Binomial(), var_weights=dd["wt"] / dd["wt"].mean())
         with warnings.catch_warnings():   # 가중치+군집 표준오차 조합 경고: 직접 계산한 값과 같은 걸 확인했어요
             warnings.simplefilter("ignore")
-            if use_psu:
-                res = model.fit(cov_type="cluster", cov_kwds={"groups": pd.factorize(d["psu"])[0]})
-            else:
-                res = model.fit(cov_type="HC1")
+            try:
+                if use_psu:
+                    res = model.fit(cov_type="cluster", cov_kwds={"groups": pd.factorize(dd["psu"])[0]})
+                else:
+                    res = model.fit(cov_type="HC1")
+            except Exception:
+                continue
         b, se = res.params["지표"], res.bse["지표"]
         rows.append({"key": key, "OR": np.exp(b), "low": np.exp(b - 1.96 * se), "high": np.exp(b + 1.96 * se),
-                     "p": res.pvalues["지표"], "n": len(d)})
-    return pd.DataFrame(rows)
+                     "p": res.pvalues["지표"], "n": len(dd)})
+    return pd.DataFrame(rows, columns=OR_COLS)
+
+
+def adjusted_or(df, case, keys):
+    """대상 그룹(case) vs 정상 그룹. case='중재 대상'이면 위험군+대사증후군 vs 정상."""
+    if case == "중재 대상":
+        sub = df.assign(_y=(df["group"] != "정상").astype(float))
+    else:
+        sub = df[df["group"].isin([case, "정상"])]
+        sub = sub.assign(_y=(sub["group"] == case).astype(float))
+    return assoc_or(sub, "_y", tuple(keys), tuple(ENERGY_ADJ))
 
 
 # ================================================================ 진단 후보와 중재 내용
-# 원인(E) 후보로 볼 행동 변수
-E_BEHAV = {"eatout_d": "외식 하루 1회 이상", "skip_bf": "아침 결식", "drink": "음주"}
+# 원인(E) 후보: 문제(P)마다 데이터로 관련성을 확인할 생활·사회경제 요인 → (이름, 이 원인이 나오면 할 중재, 중재 영역)
+E_LIB = {
+    "eatout_d": ("잦은 외식 (하루 1회 이상)", "외식·배달 메뉴 고르는 법을 교육하고, 구내식당·지역 음식점과 저염·적정량 메뉴를 함께 만들어요.", "교육 + 다분야 협의"),
+    "skip_bf": ("아침 결식", "준비 쉬운 아침 조합을 알려주고, 직장·학교에서 간편 아침을 제공하는 방안을 찾아요.", "교육 + 제공"),
+    "drink": ("고위험음주", "절주 목표를 함께 정하고 안주 고르는 법을 교육해요. 조절이 어려우면 보건소 절주 상담을 연계해요.", "상담 + 다분야 협의"),
+    "smoke": ("현재 흡연", "보건소 금연클리닉을 연계해요. 금연 후 체중이 늘지 않도록 식사 관리를 함께 안내해요.", "다분야 협의"),
+    "inactive": ("유산소 신체활동 부족", "보건소 운동 프로그램·걷기 모임과 연계해서 식사 관리와 같이 진행해요.", "다분야 협의"),
+    "no_label": ("영양표시를 읽지 않음", "가공식품 영양표시(나트륨·당류 %영양성분 기준치) 읽기 실습을 교육에 넣어요.", "교육"),
+    "p_en_hi": ("에너지 과잉 섭취", "끼니별 적정량(밥 2/3공기, 고기 손바닥 크기 등)을 눈으로 익히는 분량 교육을 해요.", "교육"),
+    "low_inc": ("가구 소득 하위 25%", "적은 비용으로 차리는 식단을 안내하고 푸드뱅크·식품바우처 같은 복지 자원과 연계해요.", "제공 + 다분야 협의"),
+    "low_edu": ("교육수준 중졸 이하", "글보다 그림·실물 모형·조리 시연 중심의 교육 자료를 써요.", "교육"),
+    "rural": ("읍·면 지역 거주", "보건지소·마을회관을 찾아가는 방문 교육으로 해요.", "제공"),
+    "alone": ("1인 가구", "편의점·간편식 고르는 법과 소포장 장보기, 한 그릇 요리를 교육해요.", "교육"),
+}
+SOCIO = {"low_inc", "low_edu", "rural", "alone"}     # 누구에게 먼저 할지 정할 때 쓰는 사회경제 요인
+NON_NUTRITION = {"smoke"}                            # 우선순위에는 보이지만 영양진단(P)은 아닌 요인
+TRACK = {
+    "대사증후군": ("관리 트랙", "2·3차 예방 · 진행과 합병증을 막아요",
+               "소그룹·개별 영양상담 주 1회 × 8주, 3개월마다 허리둘레·혈압·혈당 재측정. 약을 먹는 사람은 담당 의사와 목표를 맞춰요."),
+    "위험군": ("예방 트랙", "1차 예방 · 대사증후군으로 넘어가지 않게 해요",
+            "집단 영양교육 월 1회와 식생활 환경 개선(구내식당·지역 음식점·영양표시). 1년마다 건강검진으로 확인해요."),
+}
 
 DX = {
     "obese": {
@@ -639,60 +710,92 @@ DX = {
         "상담": ["1~2주: 음주 날짜 기록", "3~4주: 음주 주 2회 이하", "2개월: 음주 주 1회 이하"],
         "협의_키": None, "협의": "음주 조절이 어렵다면 보건소 절주 상담을 연계해요.",
     },
+    "p_en_hi": {
+        "P": "에너지 섭취 과다", "영역": "섭취", "지표": "en_eer", "지표명": "필요추정량 대비 에너지 섭취", "단위": "%",
+        "기준": f"에너지 섭취가 성별·나이별 필요추정량의 {EN_HIGH}% 초과", "E": "한 끼 양이 많거나 간식·야식·음주로 열량이 늘어남",
+        "E변수": [], "측정": "24시간 회상법", "목표선": 100,
+        "제공": "에너지 섭취를 필요추정량 수준으로 (예: 30~49세 남자 2,500kcal, 여자 1,900kcal)",
+        "교육": ["밥은 2/3공기, 고기·생선은 손바닥 크기를 한 끼 기준으로 익혀요.",
+               "음료·술·야식의 열량을 알아보고 가장 자주 먹는 것부터 줄여요.",
+               "큰 그릇 대신 작은 그릇에 덜어 먹어요."],
+        "상담": ["1~2주: 사흘 동안 먹은 것 기록", "3~4주: 야식·간식 주 2회 이하", "2개월: 한 끼 적정량 지키기 주 5일"],
+        "협의_키": None, "협의": "체중이 함께 늘고 있다면 비만 관리 프로그램과 연계해요.",
+    },
+    "inactive": {
+        "P": "신체활동 부족", "영역": "행동·환경", "지표": "inactive", "지표명": "유산소 신체활동 미실천 비율", "단위": "",
+        "기준": "중강도 주 150분·고강도 주 75분 이상의 유산소 신체활동을 하지 않음 (국민건강통계 유산소 신체활동 실천율 정의)",
+        "E": "운동할 시간·장소 부족, 좌식 업무", "E변수": [], "측정": "건강 설문",
+        "제공": "중강도 유산소 신체활동 주 150분 이상",
+        "교육": ["하루 30분 빠르게 걷기를 주 5일 해요. 10분씩 나눠도 돼요.",
+               "식후 10~15분 걷기는 혈당을 낮추는 데 도움이 돼요.",
+               "엘리베이터 대신 계단, 가까운 거리는 걸어서 가요."],
+        "상담": ["1~2주: 하루 걸음 수 기록", "3~4주: 하루 30분 걷기 주 3회", "2개월: 주 150분"],
+        "협의_키": None, "협의": "보건소 운동 프로그램·걷기 동아리와 연계해요.",
+    },
 }
 
 
-def diagnose(df):
-    """진단 후보마다 중재 대상(위험군+대사증후군)과 정상 그룹의 해당 비율을 비교해요."""
-    w, tgt, nor = df["wt"], df["target"], ~df["target"]
+PRIORITY_KEYS = [k for k in DX if k != "obese"] + ["smoke"]
+
+
+def name_of(key):
+    if key in DX:
+        return DX[key]["P"]
+    return E_LIB[key][0]
+
+
+def priority(df, case):
+    """문제 후보마다: 대상 그룹 해당 비율, 성별·나이 보정 오즈비, 인구기여위험분율(PAF).
+    PAF = 대상 그룹 중 해당 비율 × (오즈비 − 1) / 오즈비 (Miettinen 공식). 오즈비가 확실히 1보다 클 때만 계산해요."""
+    w = df["wt"]
+    cs, nor = df["group"] == case, df["group"] == "정상"
+    keys = [k for k in PRIORITY_KEYS if n_known(df.loc[cs, k]) >= 30]
+    ors = adjusted_or(df, case, keys) if keys else pd.DataFrame(columns=OR_COLS)
     rows = []
-    for key, d in DX.items():
-        x = df[key]
-        if n_known(x[tgt]) < 30 or n_known(x[nor]) < 30:
-            continue
-        p_t, p_n = wmean(x[tgt], w[tgt]), wmean(x[nor], w[nor])
-        rows.append({"key": key, "P": d["P"], "영역": d["영역"], "중재 대상": p_t, "정상": p_n, "차이": p_t - p_n,
-                     "n": n_known(x[tgt]), "공통": d.get("공통", False)})
-    return pd.DataFrame(rows)
+    for r_ in ors.itertuples():
+        x = df[r_.key]
+        pc, pn = wmean(x[cs], w[cs]), wmean(x[nor], w[nor])
+        sig = r_.low > 1
+        rows.append({"key": r_.key, "이름": name_of(r_.key), "대상 해당": pc, "정상 해당": pn, "OR": r_.OR, "low": r_.low,
+                     "high": r_.high, "PAF": pc * (r_.OR - 1) / r_.OR if sig else 0.0, "근거": sig,
+                     "영양": r_.key not in NON_NUTRITION})
+    return pd.DataFrame(rows).sort_values("PAF", ascending=False) if rows else pd.DataFrame()
 
 
-MIN_DIFF = 0.05   # 정상 그룹보다 5%p 이상 높아야 '이 집단의 문제'로 봐요
+def pick_auto(pr, df, case, k=3):
+    """공통 처방(비만)은 대상 그룹 20% 이상이면 넣고, 나머지는 영양 문제 중 근거가 있는 것을 PAF 순으로 k개."""
+    cs = df["group"] == case
+    common = ["obese"] if wmean(df.loc[cs, "obese"], df.loc[cs, "wt"]) >= 0.2 else []
+    if pr.empty:
+        return common, []
+    top = pr[pr["근거"] & pr["영양"]]["key"].head(k).tolist()
+    return common, top
 
 
-def pick_top(tab, k=3, floor=0.2, gap=MIN_DIFF):
-    """공통 처방(비만)은 따로 두고, 나머지 중 대상 그룹 해당 비율 20% 이상 · 정상보다 5%p 이상 높은 것을 차이 순으로 k개."""
-    if tab.empty:
-        return [], []
-    common = tab[tab["공통"] & (tab["중재 대상"] >= floor) & (tab["차이"] > 0)]["key"].tolist()
-    rest = tab[~tab["공통"] & (tab["중재 대상"] >= floor) & (tab["차이"] >= gap)].sort_values("차이", ascending=False)
-    return common, rest["key"].head(k).tolist()
+def causes(df, case, key):
+    """문제(P)에 해당하는 것과 관련된 생활·사회경제 요인(E)을 대상 그룹 안에서 찾아요 (성별·나이 보정)."""
+    sub = df[df["group"] == case]
+    keys = [k for k in E_LIB if k != key and n_known(sub[k]) >= 30]
+    if n_known(sub[key]) < 100 or not keys:
+        return pd.DataFrame(columns=OR_COLS)
+    res = assoc_or(sub, key, tuple(keys))
+    return res.sort_values("OR", ascending=False)
 
 
-def pes_text(df, key):
-    """PES 문장과 근거 숫자를 만들어요."""
-    d, w, tgt, nor = DX[key], df["wt"], df["target"], ~df["target"]
-    x = df[key]
-    p_t, p_n = wmean(x[tgt], w[tgt]), wmean(x[nor], w[nor])
-    ind = df[d["지표"]]
-    if d["지표"] == key or d["단위"] == "":
-        s = f"중재 대상 그룹 {d['지표명']} {p_t:.1%} (정상 그룹 {p_n:.1%})"
-    else:
-        s = (f"중재 대상 그룹 {d['지표명']} 평균 {wmean(ind[tgt], w[tgt]):,.1f}{d['단위']}, "
-             f"기준 해당 비율 {p_t:.1%} (정상 그룹 {p_n:.1%})")
-    # 원인 근거: P 해당자와 비해당자의 행동 비교 (중재 대상 그룹 안에서)
-    ev = []
-    for b in d["E변수"]:
-        if b == key or df[b].notna().sum() < 30:
-            continue
-        yes = tgt & (x == 1)
-        no = tgt & (x == 0)
-        if n_known(df.loc[yes, b]) < 10 or n_known(df.loc[no, b]) < 10:
-            continue
-        a_, b_ = wmean(df.loc[yes, b], w[yes]), wmean(df.loc[no, b], w[no])
-        if a_ > b_:
-            label = E_BEHAV[b] if b != "drink" else meta.get("drink_label", "음주")
-            ev.append(f"해당자 중 {label} {a_:.1%} (비해당자 {b_:.1%})")
-    return s, ev
+def segments(df, case, key):
+    """대상 그룹 안에서 성별 × 나이대별 해당 비율."""
+    sub = df[(df["group"] == case) & df[key].notna()]
+    band = pd.cut(sub["age"], [18, 39, 64, 200], labels=["19~39세", "40~64세", "65세 이상"])
+    out = []
+    for sx, sx_name in [(1, "남자"), (2, "여자")]:
+        for b_ in ["19~39세", "40~64세", "65세 이상"]:
+            m = (sub["sex"] == sx) & (band == b_)
+            n = int(m.sum())
+            out.append({"성별": sx_name, "나이": b_, "해당": wmean(sub.loc[m, key], sub.loc[m, "wt"]) if n >= 30 else np.nan, "n": n,
+                        "해당자": (sub.loc[m, key] * sub.loc[m, "wt"]).sum()})
+    res = pd.DataFrame(out)
+    res["해당자"] = res["해당자"] / res["해당자"].sum() if res["해당자"].sum() > 0 else np.nan
+    return res
 
 
 # ================================================================ 화면
@@ -759,9 +862,6 @@ if has_dx:
         st.caption(f"진단받은 {int(dxd.sum()):,}명을 빼고 {len(df):,}명으로 보고 있어요.")
 w = df["wt"]
 has_diet = df["energy"].notna().sum() >= 30
-
-dx_tab = diagnose(df)
-common_keys, top_keys = pick_top(dx_tab)
 
 t1, t2, t3, t4 = st.tabs(["① 영양판정", "② 영양진단", "③ 영양중재", "④ 평가계획"])
 
@@ -907,123 +1007,201 @@ with t1:
 # ---------------------------------------------------------------- ② 영양진단
 with t2:
     st.subheader("무엇이 문제이고, 왜 그런가")
-    st.write("영양판정 결과에서 문제를 골라 **집단 PES**로 써요. 문제(P), 원인(E), 근거(S)라는 형식은 개인 영양진단과 같고, "
-             "근거(S)가 한 사람의 수치 대신 집단 통계라는 점만 달라요.")
-    if dx_tab.empty:
-        st.info("진단 후보를 계산할 자료가 부족해요.")
-    else:
-        show = dx_tab.copy().sort_values(["공통", "차이"], ascending=[False, False])
-        show["선택"] = show["key"].map(lambda k: "공통 처방" if k in common_keys else ("상위 3" if k in top_keys else ""))
-        or_keys = [k for k in show["key"] if k != "obese"]
-        or_dx = adjusted_or(df, "중재 대상", or_keys) if or_keys else pd.DataFrame()
-        if not or_dx.empty:
-            or_txt = {r_.key: f"{r_.OR:.2f} ({r_.low:.2f}~{r_.high:.2f})" + (" *" if (r_.low > 1 or r_.high < 1) else "") for r_ in or_dx.itertuples()}
-            show["보정 오즈비"] = show["key"].map(or_txt).fillna("-")
-        else:
-            show["보정 오즈비"] = "-"
-        for c_ in ["중재 대상", "정상", "차이"]:
-            show[c_] = show[c_] * 100
-        st.dataframe(show[["P", "영역", "중재 대상", "정상", "차이", "보정 오즈비", "선택"]], width="stretch", hide_index=True,
-                     column_config={"중재 대상": st.column_config.NumberColumn("중재 대상 그룹 해당", format="%.1f%%"),
-                                    "정상": st.column_config.NumberColumn("정상 그룹 해당", format="%.1f%%"),
-                                    "차이": st.column_config.NumberColumn("차이 (%p)", format="%+.1f"),
-                                    "보정 오즈비": st.column_config.TextColumn("성별·나이 보정 오즈비 (95% CI)",
-                                        help="① 영양판정 C와 같은 방법. 중재 대상 그룹(위험군+대사증후군) vs 정상. *는 신뢰구간이 1을 포함하지 않음")})
-        st.caption("중재 대상 그룹 = 위험군 + 대사증후군. 고르는 규칙: 중재 대상 그룹에서 해당 비율이 20% 이상이고 정상 그룹보다 5%p 이상 높은 것 중 차이가 큰 3개. "
-                   "자동 선택은 아직 나이 보정 전 차이로 해요. 보정 오즈비가 1 근처인 문제는 나이 차이 때문일 수 있으니 고를 때 함께 보세요. "
-                   "과체중·비만은 대부분에게 공통인 기본 처방으로 따로 둬요.")
-        if not has_diet:
-            st.info("식사 자료가 없어 섭취·행동 영역 진단은 계산하지 않았어요. 국건영 영양조사 자료를 올리면 나타나요.")
+    st.write("문제 후보마다 **얼마나 흔한지**와 **성별·나이를 맞춰도 관련이 남는지**를 계산하고, 둘을 합친 "
+             "**인구기여위험분율(PAF)** 순서로 우선순위를 정해요. 그다음 문제마다 관련된 생활·사회경제 요인을 찾아 원인(E)으로 써요. "
+             "문제와 원인이 미리 정해진 게 아니라, 데이터를 바꾸면 결과도 바뀌어요.")
+    case = st.radio("어느 대상을 위한 영양진단인가", ["대사증후군", "위험군"], horizontal=True, key="track",
+                    format_func=lambda g_: f"{TRACK[g_][0]} · {g_} (vs 정상)")
+    st.caption(f"{TRACK[case][0]}: {TRACK[case][1]}")
+    cs = df["group"] == case
+    pr = priority(df, case)
+    common_keys, top_keys = pick_auto(pr, df, case)
 
-        chosen = st.multiselect("영양진단으로 쓸 문제 (기본은 자동 선택)", options=show["key"].tolist(),
-                                default=common_keys + top_keys, format_func=lambda k: DX[k]["P"], key=f"dx_pick_{uploaded}_{len(df)}")
-        st.session_state["chosen"] = chosen
-        for key in chosen:
-            d = DX[key]
-            s, ev = pes_text(df, key)
-            with st.container(border=True):
-                st.markdown(f"**{d['P']}** · {d['영역']} 영역" + (" · 공통 처방" if key in common_keys else ""))
-                st.markdown(f"- **P (문제)** {d['P']}\n- **E (원인)** {d['E']}"
-                            + (f"\n    - 데이터: {'; '.join(ev)}" if ev else "\n    - 데이터로 확인되지 않아 상담에서 확인할 원인 후보예요.")
-                            + f"\n- **S (근거)** {s}")
-                st.caption(md(f"기준: {d['기준']}"))
-                st.markdown(md(f"> 이 집단의 영양 문제는 '**{d['P']}**'이다. 원인 후보는 '**{d['E']}**'이고, 근거는 '**{s}**'이다."))
+    st.markdown("#### 1. 우선순위 · 흔하고, 관련이 큰 문제부터")
+    if pr.empty:
+        st.info("우선순위를 계산할 자료가 부족해요. 식사·생활 변수가 있는 국건영 자료를 올려 주세요.")
+    else:
+        kind = np.where(~pr["영양"], "영양 외 요인", np.where(pr["key"].isin(top_keys), "선택된 영양진단",
+                        np.where(pr["근거"], "관련 있음", "관련 불확실")))
+        palette = {"선택된 영양진단": "#C8553D", "관련 있음": "#E8A33D", "관련 불확실": "#A0A0A0", "영양 외 요인": "#5B7DB1"}
+        fig = go.Figure()
+        for k_, col_ in palette.items():
+            m = kind == k_
+            if not m.any():
+                continue
+            sub = pr[m]
+            fig.add_trace(go.Scatter(
+                x=sub["대상 해당"] * 100, y=sub["OR"], mode="markers+text", name=k_, text=sub["이름"], textposition="top center",
+                marker=dict(size=12 + 120 * sub["PAF"], color=col_, opacity=0.85, line=dict(width=1, color="white")),
+                error_y=dict(type="data", symmetric=False, array=sub["high"] - sub["OR"], arrayminus=sub["OR"] - sub["low"], color="#BBB", thickness=1),
+                customdata=np.stack([sub["low"], sub["high"], sub["PAF"] * 100], axis=-1),
+                hovertemplate="%{text}<br>해당 %{x:.1f}%<br>오즈비 %{y:.2f} (%{customdata[0]:.2f}~%{customdata[1]:.2f})<br>PAF %{customdata[2]:.1f}%<extra></extra>"))
+        fig.add_hline(y=1, line_dash="dash", line_color="#666")
+        fig.update_layout(height=470, margin=dict(t=10, b=50, l=10, r=10), yaxis_type="log", legend=dict(orientation="h", y=-0.15),
+                          xaxis_title=f"{case} 그룹에서 해당하는 비율 (%) → 흔할수록 오른쪽",
+                          yaxis_title="성별·나이 보정 오즈비 → 관련 클수록 위")
+        st.plotly_chart(fig, width="stretch")
+        st.caption("원 크기 = 인구기여위험분율(PAF). 오른쪽 위에 크게 있을수록 우선이에요. 세로 막대는 95% 신뢰구간이고, 점선(1)에 걸치면 관련이 불확실해요.")
+
+        tbl = pr.assign(**{"대상 해당": pr["대상 해당"] * 100, "정상 해당": pr["정상 해당"] * 100, "PAF": pr["PAF"] * 100,
+                           "오즈비 (95% CI)": [f"{a:.2f} ({b:.2f}–{c:.2f})" for a, b, c in zip(pr["OR"], pr["low"], pr["high"])],
+                           "판단": kind})
+        st.dataframe(tbl[["이름", "대상 해당", "정상 해당", "오즈비 (95% CI)", "PAF", "판단"]], width="stretch", hide_index=True,
+                     height=35 * (len(tbl) + 1) + 3,
+                     column_config={"이름": "문제 후보", "대상 해당": st.column_config.NumberColumn(f"{case} 해당", format="%.1f%%"),
+                                    "정상 해당": st.column_config.NumberColumn("정상 해당", format="%.1f%%"),
+                                    "PAF": st.column_config.NumberColumn("PAF", format="%.1f%%",
+                                        help="이 문제와 관련된 몫. 이 문제가 원인이라고 가정하면, 없앴을 때 대사증후군(또는 위험군)이 이만큼 줄어든다는 뜻이에요.")})
+        with st.expander("PAF(인구기여위험분율)가 뭐야?"):
+            st.markdown(md(
+                "- 오즈비는 **한 사람 기준**으로 '해당하면 몇 배 관련 있나'예요. 그런데 아주 드문 문제는 오즈비가 커도 집단 전체에 미치는 영향은 작아요.\n"
+                "- PAF는 **흔한 정도와 관련 크기를 곱한 값**이라서, '집단에서 이 문제를 해결하면 얼마나 줄어드나'를 보여줘요. "
+                "지역사회영양에서 문제의 크기와 심각도로 우선순위를 정하는 것과 같은 원리예요.\n"
+                "- 계산: PAF = (대상 그룹 중 해당 비율) × (오즈비 − 1) ÷ 오즈비. 보정 오즈비의 신뢰구간이 1보다 확실히 클 때만 계산해요.\n"
+                "- 주의: 대사증후군처럼 흔한 결과에서는 오즈비가 실제 위험비보다 커서 PAF가 다소 크게 나와요. 그리고 인과관계를 가정한 값이에요."))
+        st.caption("고르는 규칙: 과체중·비만은 판정 기준(허리둘레)과 겹쳐서 우선순위 계산에서 빼고, 대상 그룹 20% 이상이면 공통 처방으로 넣어요. "
+                   "나머지는 영양 문제 중 관련이 확실한 것을 PAF 순서로 3개까지 골라요. 흡연은 영양진단이 아니라서 다분야 협의로 보내요.")
+
+    st.markdown("#### 2. 집단 PES · 원인(E)도 데이터에서")
+    options = ["obese"] + (pr[pr["영양"]]["key"].tolist() if not pr.empty else [])
+    chosen = st.multiselect("영양진단으로 쓸 문제 (기본은 자동 선택)", options=options, default=common_keys + top_keys,
+                            format_func=lambda k: DX[k]["P"], key=f"dx_pick_{case}_{uploaded}_{len(df)}")
+    prow = pr.set_index("key") if not pr.empty else pd.DataFrame()
+    for key in chosen:
+        d = DX[key]
+        p_c = wmean(df.loc[cs, key], w[cs])
+        p_n = wmean(df.loc[df["group"] == "정상", key], w[df["group"] == "정상"])
+        s_ = f"{case} 그룹의 {d['지표명'] if d['단위'] == '' else d['P'] + ' 해당 비율'} {p_c:.1%} (정상 그룹 {p_n:.1%})"
+        if key in prow.index and prow.loc[key, "근거"]:
+            r_ = prow.loc[key]
+            s_ += f", 성별·나이 보정 오즈비 {r_['OR']:.2f} (95% CI {r_['low']:.2f}–{r_['high']:.2f}), 인구기여위험분율 {r_['PAF']:.0%}"
+        ec = causes(df, case, key)
+        sig = ec[ec["low"] > 1]
+        e_data = [f"{E_LIB[k_][0]} (오즈비 {o:.2f}, {lo:.2f}–{hi:.2f})" for k_, o, lo, hi in zip(sig["key"], sig["OR"], sig["low"], sig["high"])][:3]
+        with st.container(border=True):
+            st.markdown(f"**{d['P']}** · {d['영역']} 영역" + (" · 공통 처방" if key in common_keys else ""))
+            st.markdown(f"- **P (문제)** {d['P']}\n"
+                        + (f"- **E (원인, 데이터)** {', '.join(e_data)}\n    - {case} 그룹 안에서 이 문제에 해당하는 것과 관련된 요인이에요 (성별·나이 보정)\n"
+                           if e_data else "- **E (원인, 데이터)** 뚜렷하게 관련된 생활·사회경제 요인이 나오지 않았어요\n")
+                        + f"- **E (원인, 전공 지식)** {d['E']} · 24시간 회상 음식 자료가 없어 상담에서 확인해요\n"
+                        + f"- **S (근거)** {s_}")
+            st.caption(md(f"판정 기준: {d['기준']}"))
+            e_sent = ", ".join(E_LIB[k_][0] for k_ in sig["key"][:3]) if e_data else d["E"]
+            st.markdown(md(f"> {case} 그룹의 영양 문제는 '**{d['P']}**'이다. 관련 요인은 '**{e_sent}**'이고, 근거는 '**{s_}**'이다."))
+            with st.expander("원인 후보 전체 보기"):
+                if ec.empty:
+                    st.caption("계산할 수 있는 원인 후보가 없어요.")
+                else:
+                    et = ec.assign(이름=ec["key"].map(lambda k_: E_LIB[k_][0]), 관련=np.where(ec["low"] > 1, "있음", np.where(ec["high"] < 1, "반대 방향", "불확실")))
+                    st.dataframe(et[["이름", "OR", "low", "high", "관련", "n"]], width="stretch", hide_index=True,
+                                 column_config={"이름": "원인 후보", "OR": st.column_config.NumberColumn("오즈비", format="%.2f"),
+                                                "low": st.column_config.NumberColumn("95% 하한", format="%.2f"),
+                                                "high": st.column_config.NumberColumn("95% 상한", format="%.2f"), "n": "분석 인원"})
+    st.session_state["chosen"] = chosen
 
 # ---------------------------------------------------------------- ③ 영양중재
 with t3:
-    st.subheader("무엇을, 어떻게 바꿀까")
-    chosen = st.session_state.get("chosen", common_keys + top_keys)
-    st.write("영양진단 하나마다 카드 한 장이에요. 영양중재 4영역(식품·영양소 제공, 영양교육, 영양상담, 다분야 협의)을 틀로 썼어요. "
-             "데이터는 **누구에게, 어떤 문제부터** 할지를 정하고, 중재 내용은 근거 기반 가이드라인에서 와요.")
+    st.subheader("누구에게, 무엇부터, 어떻게")
+    st.write(f"② 영양진단의 결과로 중재를 짜요. **누구에게**는 {case} 그룹 안의 성별·나이대별 해당 비율로, **무엇부터**는 데이터가 찾은 원인(E)으로 정해요. "
+             "영양중재 4영역(식품·영양소 제공, 영양교육, 영양상담, 다분야 협의)이 틀이에요.")
+    st.info(f"**{TRACK[case][0]}** ({TRACK[case][1]}) · {TRACK[case][2]}")
     mets = df["group"] == "대사증후군"
-    if mets.sum() >= 5:
+    if case == "대사증후군" and mets.sum() >= 5:
         lean = wmean((df.loc[mets, "bmi"] < 25).astype(float), w[mets])
-        st.info(f"대사증후군 그룹의 {lean:.1%}는 BMI 25 미만이에요. 이 사람들에게는 체중 감량보다 식사의 질(아래 문제별 중재)이 중심이에요.")
+        st.caption(f"대사증후군 그룹의 {lean:.1%}는 BMI 25 미만이에요. 이 사람들에게는 체중 감량보다 식사의 질이 중심이에요.")
     if not chosen:
         st.info("② 영양진단 탭에서 문제를 하나 이상 골라 주세요.")
     for key in chosen:
         d = DX[key]
-        n_target = int((df["target"] & (df[key] == 1)).sum())
         with st.container(border=True):
             st.markdown(f"### {d['P']}")
-            st.caption(f"중재 대상 그룹에서 해당하는 사람 {n_target:,}명 (표본 기준)")
-            a, b = st.columns(2)
+            seg = segments(df, case, key)
+            ok = seg.dropna(subset=["해당"])
+            a, b = st.columns([1, 1])
             with a:
+                st.markdown("**누구에게 먼저** · 성별 × 나이대별 해당 비율")
+                if ok.empty:
+                    st.caption("하위 집단별로 나눌 만큼 자료가 없어요.")
+                else:
+                    piv = seg.pivot(index="성별", columns="나이", values="해당").reindex(index=["남자", "여자"], columns=["19~39세", "40~64세", "65세 이상"])
+                    nn = seg.pivot(index="성별", columns="나이", values="n").reindex(index=["남자", "여자"], columns=["19~39세", "40~64세", "65세 이상"])
+                    txt = [[("표본 부족" if pd.isna(v) else f"{v:.0%}") + f"<br>(n={int(n)})" for v, n in zip(rv, rn)] for rv, rn in zip(piv.values, nn.values)]
+                    fig = go.Figure(go.Heatmap(z=piv.values * 100, x=piv.columns, y=piv.index, text=txt, texttemplate="%{text}",
+                                               colorscale="Reds", showscale=False, hoverinfo="skip"))
+                    fig.update_layout(height=200, margin=dict(t=10, b=10, l=10, r=10), yaxis_autorange="reversed")
+                    st.plotly_chart(fig, width="stretch", key=f"seg_{key}")
+                    big = ok[ok["n"] >= 50]
+                    if not big.empty:
+                        hi_ = big.sort_values("해당", ascending=False).iloc[0]
+                        many = big.sort_values("해당자", ascending=False).iloc[0]
+                        st.markdown(f"→ 고위험 접근 (비율이 가장 높은 집단): **{hi_['나이']} {hi_['성별']}** {hi_['해당']:.0%}  \n"
+                                    f"→ 인구집단 접근 (해당자가 가장 많은 집단): **{many['나이']} {many['성별']}**, {case} 그룹 해당자의 {many['해당자']:.0%}")
+                    st.caption("표본 50명 미만인 칸은 우선 대상을 고를 때 빼요.")
+            ec = causes(df, case, key)
+            sig = ec[ec["low"] > 1]
+            with b:
+                st.markdown("**무엇부터** · 데이터가 찾은 원인에 맞춘 중재")
+                if sig.empty:
+                    st.caption("뚜렷한 원인 요인이 없어 아래 기본 중재로 시작해요.")
+                for k_, o in zip(sig["key"], sig["OR"]):
+                    nm, act, area = E_LIB[k_]
+                    tag = "대상 선정" if k_ in SOCIO else area
+                    st.markdown(f"- **{nm}** (오즈비 {o:.2f}) → {act} `{tag}`")
+            c, e = st.columns(2)
+            with c:
                 st.markdown("**식품·영양소 제공** · 목표")
                 st.write(d["제공"])
                 st.markdown("**영양교육** · 구체적 실천 방안")
                 st.markdown("\n".join(f"- {md(t)}" for t in d["교육"]))
-            with b:
+            with e:
                 st.markdown("**영양상담** · 작게 시작하는 단계별 목표")
                 st.markdown("\n".join(f"- {md(t)}" for t in d["상담"]))
                 st.markdown("**영양관리를 위한 다분야 협의** · 연계")
                 ck = d.get("협의_키")
                 if ck and df[ck].notna().any() and df[{"undx_ht": "ht_dx", "undx_dm": "dm_dx", "undx_dl": "dl_dx"}[ck]].notna().any():
-                    st.write(f"{d['협의']} 해당 {int((df['target'] & df[ck]).sum()):,}명")
+                    st.write(f"{d['협의']} {case} 그룹 해당 {int((cs & df[ck]).sum()):,}명 (표본 기준)")
                 else:
                     st.write(d["협의"])
-    st.caption("중재 문구는 식품영양학과 검토 초안이에요. 섭취기준·진료지침 원문으로 목표값을 확인해야 해요.")
+    if not pr.empty and "smoke" in set(pr.loc[pr["근거"], "key"]):
+        r_ = pr.set_index("key").loc["smoke"]
+        st.warning(f"영양 외 요인 · 현재 흡연도 {case} 그룹과 관련이 있어요 (오즈비 {r_['OR']:.2f}). 보건소 금연클리닉 연계를 다분야 협의에 넣어요.")
+    st.caption("교육·상담 문구는 식품영양학과 검토 초안이에요. 섭취기준·진료지침 원문으로 목표값을 확인해야 해요.")
 
 # ---------------------------------------------------------------- ④ 평가계획
 with t4:
     st.subheader("효과를 무엇으로, 어떻게 확인할까")
     st.write("국건영은 매년 다른 사람을 조사해서 같은 사람의 변화를 따라갈 수 없어요. 그래서 개인 모니터링 대신 **평가계획**을 세워요. "
-             "영양진단의 근거(S)가 그대로 평가 지표가 되고, 영양판정 5개 영역 중 과거력을 뺀 4개 영역에서 지표를 골라요.")
-    chosen = st.session_state.get("chosen", common_keys + top_keys)
+             "② 영양진단의 근거(S)가 그대로 평가 지표가 되고, 지금 값이 기준선이에요.")
     cut = st.slider("목표: 해당 비율을 지금보다 몇 % 줄일까 (상대 감소)", 5, 50, 20, 5)
-    tgt = df["target"]
-    plan = []
+    plan, eff = [], []
+    share = wmean(cs.astype(float), w)
     for key in chosen:
         d = DX[key]
-        now = wmean(df.loc[tgt, key], w[tgt])
-        plan.append({"영양진단": d["P"], "지표": f"{d['지표명']} 기준 해당 비율", "현재": now, "목표": now * (1 - cut / 100),
-                     "측정 방법": d["측정"], "재평가": "1년 (국건영 조사 주기)"})
+        now = wmean(df.loc[cs, key], w[cs])
+        plan.append({"영양진단": d["P"], "지표": f"{d['지표명']} 기준 해당 비율" if d["단위"] else d["지표명"],
+                     "기준선 (지금)": now * 100, "목표": now * (1 - cut / 100) * 100, "측정 방법": d["측정"], "재평가": "1년 (국건영 조사 주기)"})
+        if key in prow.index and prow.loc[key, "PAF"] > 0:
+            paf = prow.loc[key, "PAF"]
+            eff.append({"영양진단": d["P"], "PAF": paf, "예상 감소": paf * cut / 100})
     if plan:
         st.dataframe(pd.DataFrame(plan), width="stretch", hide_index=True,
-                     column_config={"현재": st.column_config.NumberColumn(format="percent"),
-                                    "목표": st.column_config.NumberColumn(format="percent")})
-        st.caption("목표 감소 폭은 팀 논의 후 정해요. 지금은 슬라이더로 바꿔 볼 수 있어요.")
-
-    st.markdown("**기대 효과** · 기준을 넘는 사람이 기준선까지 맞추면")
-    eff = []
-    for key in chosen:
-        d = DX[key]
-        x = df[d["지표"]]
-        if key == "obese":
-            after_bmi = np.where(df["bmi"] >= 25, df["bmi"] * 0.95, df["bmi"])
-            before, after = wmean(df.loc[tgt, "obese"], w[tgt]), wmean(pd.Series(after_bmi >= 25, index=df.index)[tgt].astype(float), w[tgt])
-            eff.append({"영양진단": d["P"], "가정": "BMI 25 이상인 사람이 체중 5% 감량", "지표": "비만 비율",
-                        "지금": f"{before:.1%}", "가정 후": f"{after:.1%}"})
-        elif "목표선" in d and x.notna().sum() >= 30:
-            line = df[d["목표선"]] if isinstance(d["목표선"], str) else d["목표선"]
-            capped = x.clip(upper=line)
-            before, after = wmean(x[tgt], w[tgt]), wmean(capped[tgt], w[tgt])
-            line_txt = "자기 나이의 기준" if isinstance(d["목표선"], str) else f"{d['목표선']:,}{d['단위']}"
-            eff.append({"영양진단": d["P"], "가정": f"기준 초과자가 {line_txt}까지 줄임",
-                        "지표": f"그룹 평균 {d['지표명']}", "지금": f"{before:,.1f}{d['단위']}", "가정 후": f"{after:,.1f}{d['단위']}"})
+                     column_config={"기준선 (지금)": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "목표": st.column_config.NumberColumn(format="%.1f%%")})
+    st.markdown(f"**기대 효과** · 해당 비율을 {cut}% 줄이면 {case} 그룹은 얼마나 줄까")
     if eff:
-        st.dataframe(pd.DataFrame(eff), width="stretch", hide_index=True)
-        st.caption("단순 계산이에요. 실제로 그만큼 바뀐다는 보장이 아니라, 목표를 세울 때 크기를 가늠하는 용도예요.")
+        et = pd.DataFrame(eff)
+        both = 1 - np.prod(1 - et["예상 감소"])
+        et = pd.concat([et, pd.DataFrame([{"영양진단": "모두 함께", "PAF": np.nan, "예상 감소": both}])], ignore_index=True)
+        et["성인 100명당"] = share * et["예상 감소"] * 100
+        et["PAF"] = [("-" if pd.isna(v) else f"{v:.1%}") for v in et["PAF"]]
+        st.dataframe(et.assign(**{"예상 감소": et["예상 감소"] * 100}), width="stretch", hide_index=True,
+                     column_config={
+                                    "예상 감소": st.column_config.NumberColumn(f"{case} 그룹 상대 감소", format="%.1f%%"),
+                                    "성인 100명당": st.column_config.NumberColumn(f"성인 100명당 줄어드는 {case} (명)", format="%.2f")})
+        st.caption(f"계산: 예상 감소 = PAF × 줄이는 비율. 지금 {case} 그룹은 성인의 {share:.1%}예요. '모두 함께'는 문제들이 서로 독립이라고 가정해 합쳤어요. "
+                   "관련성을 인과로 가정한 최대 추정치라서, 실제 효과는 이보다 작을 수 있어요.")
+    else:
+        st.caption("PAF를 계산할 수 있는 영양진단이 없어요 (과체중·비만은 판정 기준과 겹쳐서 계산에서 빠져요).")
     st.markdown("**한계**")
     st.markdown("- 같은 날 잰 단면 자료라, 식사와 대사 위험이 함께 나타나는 관계(연관성)만 볼 수 있어요.\n"
                 "- 24시간 회상법은 하루치라 한 사람의 평소 식사를 대표하지 못해요. 집단 평균·비율로만 해석해요.\n"
