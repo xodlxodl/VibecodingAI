@@ -1,6 +1,8 @@
 """엔진 실험실 (담당: 수학과 B)
 내 CSV 하나를 올리면, 그 파일이 공용 엔진에서 제대로 돌아가는지 점검해요.
 1) CSV 입력 → 2) 탭별 점검(기본 실행 · 데이터 진단 · 이상 심기 240회 · 기준값 k · robust Z 대조 · 숫자 검증기) → 3) 종합 판정(AI 리포트).
+2026-11-25 고침: 로그 척도 열은 같은 척도에서 이상을 심음 · 시계열은 원래 이벤트에 얹혀 '잡음'으로 채점되지 않게 함 ·
+조사 가중치·응답 코드·설정 단계 열과 자동 선택 상한을 진단 · k 추천을 k 탭 결과와 맞춤 · 숫자 검증기에서 날짜·시각 조각을 뺌.
 모든 점검은 올린 파일의 실제 값으로 그 자리에서 계산해요. 같은 파일·같은 설정이면 저장해 둔 결과를 다시 써요.
 AI 리포트: 점검 요약(원본 행 없음)만 AI에게 보내고, 리포트 속 숫자를 verify_numbers로 대조해 틀리면 최대 2번 다시 쓰게 해요.
 API 키는 Streamlit Secrets의 ANTHROPIC_API_KEY에 넣어요(코드·저장소에 넣지 않음). 키가 없으면 기본 판정과 '가짜 AI'로 흐름만 시험할 수 있어요.
@@ -40,7 +42,15 @@ TABLE_KINDS = ["높은 쪽 극단값", "낮은 쪽 극단값", "자릿수 실수
 TABLE_SIZES = {"높은 쪽 극단값": [2, 3, 4, 6], "낮은 쪽 극단값": [2, 3, 4, 6], "자릿수 실수": ["×10", "×100", "÷10", "÷100"]}
 K_GRID = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
 BIG_ROWS = 50000
-CODE_NAME_RE = re.compile(r"코드|번호|구분|ID|Id|id|code|Code|no\.?$|No\.?$")
+# 'width'·'humidity'처럼 단어 안에 든 id는 ID로 보지 않음 (대문자 ID는 어디에 있어도 ID로 봄: IDpol, PatientID)
+CODE_NAME_RE = re.compile(r"코드|번호|구분|ID|(?<![A-Za-z])[Ii]d(?![a-z])|code|Code|no\.?$|No\.?$")
+# 표본 조사 설계 변수: 가중치·층·집락. 숫자지만 '측정값'이 아니라서 이상치를 찾을 대상이 아님 (국민건강영양조사 wt_itvex, kstrata, psu 등)
+# 몸무게(HE_wt, body_weight)와 헷갈리지 않게 'wt_'로 시작하거나 조사·표본 가중치라고 적힌 이름만 봄
+DESIGN_NAME_RE = re.compile(r"^wt_|(?:survey|sampl\w*)[_ ]?weight|가중치|strata|stratum|층화|^psu$|집락", re.IGNORECASE)
+SURVEY_CODES = {8, 9, 88, 99, 888, 999, 8888, 9999}   # 설문 자료에서 '비해당·모름·무응답'에 흔히 쓰는 값
+SETTING_MAX_LEVELS = 10    # 값이 이만큼 이하인 정수·단계 열은 측정값보다 설정값·응답 코드일 가능성이 큼
+EDGE_MARGIN = 2            # 시계열 이상 심기: 원래 이벤트와 이만큼(행) 떨어진 자리에만 심음
+HIT_TOLERANCE = 2          # 시계열 이상 심기: 심은 자리보다 이만큼(행) 앞에서 시작한 이벤트까지만 '잡음'으로 인정
 BLUE, ORANGE, GRAY = "#2a78d6", "#eb6834", "#9a9890"
 
 AI_URL = "https://api.anthropic.com/v1/messages"
@@ -88,8 +98,50 @@ def _looks_like_code(table, col_name):
     return lead0 >= 0.3 or bool(CODE_NAME_RE.search(col_name)), lead0
 
 
-def diagnose(res, requested_mode):
-    """파일이 엔진에 맞는지 항목별로 점검. 상태: 좋음 / 주의 / 문제"""
+def _pct(r):
+    """비율 표시: 0%·100%로 반올림돼서 '모두 비어 있다'처럼 잘못 읽히지 않게, 끝자리는 소수 한 자리로"""
+    if 0 < r < 0.005 or 0.995 <= r < 1:
+        return f"{r:.1%}"
+    return f"{r:.0%}"
+
+
+def _column_kind(prof_col, values, mode):
+    """분석 열이 '측정값'이 아닐 수 있는 이유 하나를 돌려줌 (없으면 None).
+    design = 조사 가중치·층·집락 / survey = 8·9 같은 응답 코드가 섞인 정수 열 / setting = 값 몇 가지뿐인 설정·단계 열"""
+    name = prof_col["name"]
+    if DESIGN_NAME_RE.search(name):
+        return "design", "조사 가중치·층·집락 같은 설계 변수"
+    fin = np.asarray([v for v in values if np.isfinite(v)], dtype=float)
+    if len(fin) < 30:            # 값이 너무 적으면 모양으로 판단하지 않음(빈칸 진단이 따로 잡음)
+        return None
+    levels = np.unique(fin)
+    all_int = bool(np.all(np.abs(fin - np.round(fin)) < 1e-9))
+    if all_int and len(levels) <= SETTING_MAX_LEVELS + 2:
+        codes = [int(v) for v in levels if int(v) in SURVEY_CODES]
+        share = float(np.isin(fin, codes).mean()) if codes else 0.0
+        if codes and int(levels.max()) in SURVEY_CODES and share >= 0.02:
+            return "survey", f"응답 코드 열(값 {', '.join(map(str, codes))}가 {share:.0%} — '비해당·모름' 코드일 수 있음)"
+    if len(levels) <= SETTING_MAX_LEVELS and (all_int or mode == "timeseries"):
+        what = "설정값·단계처럼 보이는 열" if mode == "timeseries" else "값이 몇 가지뿐인 등급·코드 열"
+        return "setting", f"{what}(값 {len(levels)}가지)"
+    return None
+
+
+def default_target(out):
+    """이상 심기 실험 열 기본값: 엔진이 Z를 쓰는 연속 측정값 중 첫 열 (설정·코드 열, 절반 넘게 같은 값인 열은 뒤로)"""
+    cols = out["prep"]["cols"]
+    prof_cols = {c["name"]: c for c in out["profile"]["cols"]}
+    for c in cols:
+        if c.get("discrete") or c["name"] not in prof_cols:
+            continue
+        if _column_kind(prof_cols[c["name"]], np.asarray(c["values"], dtype=float), out["mode"]) is None:
+            return c["name"]
+    return out["columns"][0]
+
+
+def diagnose(res, requested_mode, picked=()):
+    """파일이 엔진에 맞는지 항목별로 점검. 상태: 좋음 / 주의 / 문제
+    picked = 사용자가 '분석할 열'에서 직접 고른 열(비어 있으면 엔진 자동 선택)"""
     table, out, prof = res["table"], res["out"], res["out"]["profile"]
     n, mode, items = prof["n"], out["mode"], []
 
@@ -99,10 +151,26 @@ def diagnose(res, requested_mode):
     add("파일 읽기", "좋음", f"{n:,}행 × {len(table['columns'])}열 · 글자 인코딩 {table.get('encoding', '?')}", key="read")
     role_ko = {"numeric": "숫자", "time": "시간", "personal": "개인정보", "label": "정답 라벨", "counter": "번호·순번",
                "constant": "값이 하나뿐", "category": "범주", "text": "글자"}
-    skipped = [f"{c['name']}({role_ko.get(c['role'], c['role'])})" for c in prof["cols"]
-               if c["name"] not in out["columns"] and c["role"] != "time"]
+    # 엔진 자동 선택은 '값이 변하는 숫자 열'을 파일 앞에서부터 최대 개수(표 12 · 시계열 6)까지만 골라요.
+    # 그래서 뒤쪽 숫자 열은 이유 없이 빠질 수 있음 → 빠진 이유를 '상한 초과'로 밝히고 따로 경고
+    limit = 12 if mode == "table" else 6
+    eligible = [c["name"] for c in prof["cols"] if c["role"] == "numeric" and c.get("stats") and c["stats"]["std"] > 0]
+    over_cap = [x for x in eligible if x not in out["columns"]] if not picked else []
+
+    def why(c):
+        if c["name"] in over_cap:
+            return f"숫자 · 자동 선택 상한 {limit}개 초과"
+        if c["role"] == "numeric" and picked:
+            return "숫자 · 직접 고르지 않음"
+        return role_ko.get(c["role"], c["role"])
+    skipped = [f"{c['name']}({why(c)})" for c in prof["cols"] if c["name"] not in out["columns"] and c["role"] != "time"]
     add("분석한 열", "좋음", f"{len(out['columns'])}개: {', '.join(out['columns'])}",
         ("분석에서 뺀 열: " + ", ".join(skipped[:8]) + (" 외" if len(skipped) > 8 else "")) if skipped else "", key="cols")
+    if over_cap:
+        add("자동 선택 상한", "주의",
+            f"엔진은 숫자 열을 파일 앞쪽부터 {limit}개까지만 자동으로 골라요. 그래서 숫자 열 {len(over_cap)}개를 보지 않았어요: "
+            + ", ".join(over_cap[:10]) + (" 외" if len(over_cap) > 10 else ""),
+            "중요한 측정값이 빠졌다면 위의 '분석할 열'에서 직접 고르세요.", key="cap", _cols=over_cap)
 
     # 모드가 데이터 모양과 맞는지
     tinfo = prof["time"]
@@ -123,18 +191,56 @@ def diagnose(res, requested_mode):
         add("모드와 데이터 모양", "좋음", note + " 행마다 따로 이상치를 찾고 이벤트로 묶지 않아요.",
             "센서처럼 행 순서가 시간이라면 '시계열'을 고르세요." if requested_mode == "auto" else "", key="mode")
 
-    # 이름표 같은 숫자 열
-    codes, code_names = [], []
+    # 이름표 같은 숫자 열: 이름·앞자리 0뿐 아니라 값 모양(조사 설계 변수, 8·9 응답 코드, 값 몇 가지뿐인 열)도 봄
+    prof_by = {c["name"]: c for c in prof["cols"]}
+    prep_by = {c["name"]: c for c in out["prep"]["cols"]}
+    codes, code_names, settings, setting_names = [], [], [], []
     for name in out["columns"]:
         is_code, lead0 = _looks_like_code(table, name)
+        kind = _column_kind(prof_by[name], np.asarray(prep_by[name]["values"], dtype=float), mode) if name in prep_by else None
         if is_code:
             code_names.append(name)
-            codes.append(f"{name}" + (f"(앞자리 0 {lead0:.0%})" if lead0 >= 0.3 else ""))
+            codes.append(f"{name}" + (f"(앞자리 0 {lead0:.0%})" if lead0 >= 0.3 else "(이름이 코드·번호)"))
+        elif kind and kind[0] in ("design", "survey"):
+            code_names.append(name)
+            codes.append(f"{name}({kind[1]})")
+        elif kind and kind[0] == "setting":
+            setting_names.append(name)
+            settings.append(f"{name}({kind[1]})")
     if codes:
         add("이름표 같은 숫자 열", "주의", "숫자 크기에 뜻이 없을 수 있는 열을 숫자로 분석했어요: " + ", ".join(codes),
-            "센터·지역·상품 코드라면 위의 '분석할 열'에서 빼세요.", key="code_cols", _cols=code_names)
+            "센터·지역·상품 코드나 조사 가중치·응답 코드라면 위의 '분석할 열'에서 빼세요.", key="code_cols", _cols=code_names)
     else:
-        add("이름표 같은 숫자 열", "좋음", "코드·번호처럼 보이는 열은 분석하지 않았어요.", key="code_cols")
+        add("이름표 같은 숫자 열", "좋음", "코드·번호·조사 설계 변수처럼 보이는 열은 분석하지 않았어요.", key="code_cols")
+    if settings:
+        if mode == "timeseries":
+            add("설정·단계 열", "주의", "측정값이 아니라 설정값·단계로 보이는 열을 센서처럼 분석했어요: " + ", ".join(settings)
+                + ". 단계가 바뀔 때마다 이벤트가 생기고, 기준 구간 진단도 흔들려요.",
+                "층 높이·레시피 단계처럼 일부러 바꾸는 값이면 분석 열에서 빼세요. 단계가 바뀐 시점은 다른 열의 이벤트를 읽을 때 참고로 쓰세요.",
+                key="setting_cols", _cols=setting_names)
+        else:
+            add("설정·단계 열", "주의", "값이 몇 가지뿐인 정수 열을 연속 측정값처럼 분석했어요: " + ", ".join(settings),
+                "등급·횟수·응답 번호라면 분석 열에서 빼고 분포표로 보세요.", key="setting_cols", _cols=setting_names)
+
+    # 같은 값 몰림: 값이 다양한 연속 열인데 한 값이 유난히 많음 → 정액 처리·기본값·대체값(결측을 채운 값)일 수 있음.
+    # 엔진은 이런 값을 '평범한 값'으로 보므로 이상으로 잡히지 않지만, 분석 결과(중앙값·분포)를 끌어당김
+    spikes = []
+    for c in out["prep"]["cols"]:
+        if c["name"] in code_names or c["name"] in setting_names:
+            continue
+        v = pd.Series(np.asarray(c["values"], dtype=float)).dropna()
+        if len(v) < 100 or v.nunique() < 50:
+            continue
+        vc = v.value_counts()
+        top_val, top_n, second = vc.index[0], int(vc.iloc[0]), int(vc.iloc[1]) if len(vc) > 1 else 0
+        # 한 값이 3% 이상, 20행 이상이고 두 번째로 많은 값의 2배를 넘을 때만 (우연히 같은 값 몇 개는 제외)
+        if top_n / len(v) >= 0.03 and top_n >= 20 and top_n >= 2 * max(1, second):
+            edge = " · 가장 큰 값" if top_val == v.max() else (" · 가장 작은 값" if top_val == v.min() else "")
+            spikes.append(f"{c['name']} = {top_val:g} ({top_n:,}행, {top_n / len(v):.1%}{edge})")
+    if spikes:
+        add("같은 값 몰림", "주의", "값이 다양한 열인데 한 값이 유난히 많아요: " + ", ".join(spikes[:5]),
+            "정액 처리·기본값·빈칸을 채운 값이거나, 끝값으로 묶은 값(예: '80세 이상'을 80으로 기록)일 수 있어요. "
+            "엔진은 이 값을 평범한 값으로 보니 따로 확인하세요.", key="spike")
 
     # 중복 행
     dup = prof["duplicates"]
@@ -145,16 +251,28 @@ def diagnose(res, requested_mode):
         add("중복 행", "좋음", f"완전히 같은 행 {dup:,}개" + (" (표 모드라 빼지 않음)" if mode == "table" and dup else ""), key="dup")
 
     # 빈칸
-    miss = [(c["name"], c["missing"] / max(1, n)) for c in prof["cols"] if c["name"] in out["columns"]]
-    worst = max(miss, key=lambda x: x[1]) if miss else ("", 0)
+    miss = [(c["name"], c["missing"] / max(1, n), n - c["missing"]) for c in prof["cols"] if c["name"] in out["columns"]]
+    worst = max(miss, key=lambda x: x[1]) if miss else ("", 0, n)
+    filled_note = f" 값이 있는 행은 {worst[2]:,}개뿐이에요." if worst[1] >= 0.5 else ""
     if worst[1] >= 0.5:
-        add("빈칸", "문제", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "빈칸이 많은 열은 분석 열에서 빼세요.",
-            key="missing", _cols=[w for w, r in miss if r >= 0.5])
+        add("빈칸", "문제", f"{worst[0]} 열의 {_pct(worst[1])}가 비어 있어요.{filled_note}",
+            "빈칸이 많은 열은 분석 열에서 빼세요. 임신부만 답하는 문항처럼 일부에게만 해당하는 열이면 그 사람들만 따로 보세요.",
+            key="missing", _cols=[w for w, r, _ in miss if r >= 0.5])
     elif worst[1] >= 0.2:
-        add("빈칸", "주의", f"{worst[0]} 열의 {worst[1]:.0%}가 비어 있어요.", "시계열은 빈칸을 앞뒤 값으로 채워서 봐요.",
-            key="missing", _cols=[w for w, r in miss if r >= 0.2])
+        add("빈칸", "주의", f"{worst[0]} 열의 {_pct(worst[1])}가 비어 있어요.", "시계열은 빈칸을 앞뒤 값으로 채워서 봐요.",
+            key="missing", _cols=[w for w, r, _ in miss if r >= 0.2])
     else:
         add("빈칸", "좋음", f"분석 열의 빈칸 비율 최대 {worst[1]:.1%}", key="missing")
+
+    # 측정 간격(시계열): 평소 간격보다 길게 빈 곳 = 기록이 빠진 시각
+    if mode == "timeseries" and tinfo and tinfo.get("intervalMs"):
+        gaps, step = tinfo["gaps"], tinfo["intervalMs"] / 1000
+        step_txt = f"{step:g}초" if step < 120 else f"{step / 60:g}분"
+        if gaps / max(1, n) >= 0.01:
+            add("측정 간격", "주의", f"평소 간격 {step_txt}보다 길게 빈 곳이 {gaps:,}군데({gaps / n:.1%}) 있어요.",
+                "엔진은 빈 시각을 건너뛰고 행 순서대로 이어서 봐요. 빠진 시각이 많으면 이벤트 길이·지연이 실제와 달라져요.", key="gaps")
+        else:
+            add("측정 간격", "좋음", f"평소 간격 {step_txt} · 길게 빈 곳 {gaps:,}군데", key="gaps")
 
     # 잡힌 비율
     rows = out["result"]["rows"]
@@ -179,6 +297,8 @@ def diagnose(res, requested_mode):
         nb = out["base"]["nb"]
         moved = []
         for c in out["prep"]["cols"]:
+            if c["name"] in setting_names:      # 설정·단계 열은 원래 바뀌는 값이라 기준 구간 판단에서 뺌
+                continue
             rest = np.array(c["filled"][nb:], dtype=float)
             if len(rest) and c["sigma"] > 0:
                 shift = abs(np.nanmedian(rest) - c["mu"]) / c["sigma"]
@@ -186,7 +306,8 @@ def diagnose(res, requested_mode):
                     moved.append(f"{c['name']}({shift:.1f}σ)")
         if moved:
             add("기준 구간", "주의", f"엔진은 앞쪽 {nb:,}행을 정상 기준으로 삼는데, 나머지 구간의 수준이 크게 달라요: " + ", ".join(moved),
-                "앞부분이 정상 운전이 아니면 이벤트가 많이 나와요. 정상 구간이 앞에 오도록 파일을 자르세요.", key="baseline")
+                "두 경우로 나눠 보세요. 앞부분이 시운전·고장 구간이면 정상 구간이 앞에 오도록 파일을 자르세요. "
+                "앞부분이 정상이고 뒤로 갈수록 바뀐 거라면, 그 변화가 바로 찾으려는 이상(열화·고장 전조)일 수 있어요.", key="baseline")
         else:
             add("기준 구간", "좋음", f"앞쪽 {nb:,}행을 정상 기준으로 삼았고, 나머지 구간과 수준 차이가 크지 않아요.", key="baseline")
 
@@ -249,8 +370,22 @@ def _inject_ts(y, kind, size, sigma, s, L, rng):
     return y
 
 
+def _free_starts(N, L, base_ev, lo):
+    """원래 이벤트와 EDGE_MARGIN행 넘게 떨어져서 길이 L짜리 이상을 심을 수 있는 시작 행들"""
+    out = []
+    for s in range(lo, N - L):
+        seg = (s - EDGE_MARGIN, s + L - 1 + EDGE_MARGIN)
+        if not any(_overlap(seg, b) for b in base_ev):
+            out.append(s)
+    return out
+
+
 def ts_trials(win, target, k, kinds, sizes, reps):
-    """시계열: 실험 창의 대상 열에 이상을 하나씩 심고 엔진을 다시 돌려 잡는지 봄"""
+    """시계열: 실험 창의 대상 열에 이상을 하나씩 심고 엔진을 다시 돌려 잡는지 봄.
+    - 원래 이벤트와 겹치지 않는 자리에만 심음. 그런 자리가 없으면 '해당 없음'(점수에서 뺌).
+      예전에는 50번 찾다 못 찾으면 그냥 이벤트 위에 심어서, 원래 있던 긴 이벤트가 심은 이상을 '잡은' 것으로 채점됐음.
+    - '잡음'은 심은 구간과 겹치면서 심은 자리 근처(HIT_TOLERANCE행 이내 앞)나 그 뒤에서 시작한 이벤트만 인정.
+      훨씬 앞에서 시작해 우연히 이어져 있던 이벤트는 엔진이 심은 이상을 알아본 게 아니므로 인정하지 않음."""
     N = len(win)
     base_ev = _ts_segments(win, k)
     sigma = _robust_sigma(win[target].values)
@@ -258,25 +393,37 @@ def ts_trials(win, target, k, kinds, sizes, reps):
     recs = []
     for ki, kind in enumerate(kinds):
         L = 1 if kind == "튀는 값" else L_long
+        lo = int(N * 0.35)          # 앞 30%는 엔진의 기준 구간이라 그 뒤에 심음
+        free = _free_starts(N, L, base_ev, lo)
         for si, size in enumerate(sizes):
             for rep in range(reps):
+                if not free:
+                    recs.append({"종류": kind, "크기": size, "반복": rep, "해당 없음": True,
+                                 "사유": "원래 이벤트와 겹치지 않는 자리가 없음"})
+                    continue
                 rng = np.random.default_rng(10000 * ki + 100 * si + rep)
-                lo, hi = int(N * 0.35), N - L - 1
-                s = int(rng.integers(lo, hi)) if hi > lo else lo
-                for _ in range(50):   # 원래 있던 이벤트와 겹치지 않는 자리에 심음
-                    if not any(_overlap((s, s + L - 1), b) for b in base_ev):
-                        break
-                    s = int(rng.integers(lo, hi)) if hi > lo else lo
+                s = int(rng.choice(free))
                 df = win.copy()
                 df[target] = _inject_ts(win[target].values, kind, size, sigma, s, L, rng)
                 ev = _ts_segments(df, k)
                 seg = (s, s + L - 1)
-                hits = [e for e in ev if _overlap(e, seg)]
+                hits = [e for e in ev if _overlap(e, seg) and e[0] >= s - HIT_TOLERANCE]
                 fp = sum(1 for e in ev if not _overlap(e, seg) and not any(_overlap(e, b) for b in base_ev))
                 recs.append({"종류": kind, "크기": size, "반복": rep, "시작": s, "길이": L, "잡음": bool(hits), "오탐": fp,
-                             "지연": (min(e[0] for e in hits) - s) if hits else None, "잡은 구간": ev,
+                             "지연": (min(e[0] for e in hits) - s) if hits else None, "잡은 구간": ev, "해당 없음": False,
                              "y": df[target].values if rep == 0 else None})   # 첫 번째 반복만 그래프용으로 보관
     return recs, base_ev, sigma
+
+
+def ts_trials_auto(win, target, k, kinds, sizes, reps, solo=None):
+    """모든 분석 열로 실험해 보고, 다른 열의 원래 이벤트가 창을 덮어 심을 자리가 하나도 없으면 대상 열만 넣고 다시 실험.
+    solo를 정해 주면(k 탭이 이상 심기 탭과 같은 방식을 쓰도록) 그대로 따름. → (recs, 원래 이벤트, σ, solo)"""
+    if solo is None or solo is False:
+        recs, base_ev, sigma = ts_trials(win, target, k, kinds, sizes, reps)
+        if solo is False or any(not r.get("해당 없음") for r in recs) or win.shape[1] == 1:
+            return recs, base_ev, sigma, False
+    recs, base_ev, sigma = ts_trials(win[[target]], target, k, kinds, sizes, reps)
+    return recs, base_ev, sigma, True
 
 
 def table_sample(out):
@@ -287,23 +434,47 @@ def table_sample(out):
     return pd.DataFrame(data)
 
 
-def _table_flags(df, k):
+def _table_run(df, k):
     o = run_engine(df, columns=list(df.columns), mode="table", k=k)
-    return {r["i"] for r in o["result"]["outliers"]}
+    return {r["i"] for r in o["result"]["outliers"]}, o
+
+
+def _table_flags(df, k):
+    return _table_run(df, k)[0]
+
+
+def table_scale(o, target, y):
+    """엔진이 대상 열을 어떤 척도로 보는지 그대로 따라 함: (척도, 중앙값, σ, 정방향 변환, 역변환).
+    엔진은 0 이상이고 오른쪽으로 길게 늘어진 열(보험금·간수치)을 log(x + shift)로 바꿔서 Z를 계산하므로,
+    '4σ 이상'도 그 척도에서 4σ여야 엔진 기준과 같은 크기의 이상이 됨"""
+    c = next(c for c in o["prep"]["cols"] if c["name"] == target)
+    fin = y[np.isfinite(y)]
+    if c.get("scale") == "log":
+        shift = 0.0 if fin.min() > 0 else 1.0
+        fwd, inv = (lambda v: np.log(v + shift)), (lambda t: float(np.exp(t) - shift))
+        t = fwd(fin)
+        return "로그", float(np.median(t)), _robust_sigma(t), fwd, inv, c
+    return "원래", float(np.median(fin)), _robust_sigma(fin), (lambda v: v), (lambda t: float(t)), c
 
 
 def table_trials(sample, target, k, kinds, sizes_of, reps):
-    """표: 표본의 대상 열에서 한 행의 값을 극단값·자릿수 실수로 바꾸고 엔진이 그 행을 잡는지 봄"""
-    base = _table_flags(sample, k)
+    """표: 표본의 대상 열에서 한 행의 값을 극단값·자릿수 실수로 바꾸고 엔진이 그 행을 잡는지 봄.
+    극단값은 엔진이 보는 척도(원래 값 또는 로그)에서 중앙값 ± 크기×σ로 만듦.
+    예전에는 로그 척도 열에도 원래 값의 σ로 심어서, 엔진 기준으로는 평범한 값을 '못 잡았다'고 채점했음."""
+    base, o = _table_run(sample, k)
     y = sample[target].values
+    scale, med, sigma, fwd, inv, col = table_scale(o, target, y)
     fin = y[np.isfinite(y)]
-    med, sigma, nonneg = float(np.median(fin)), _robust_sigma(fin), bool(len(fin) and fin.min() >= 0)
+    nonneg = bool(len(fin) and fin.min() >= 0)
     ok_rows = [i for i in range(len(y)) if np.isfinite(y[i]) and i not in base]
     recs = []
+    if col.get("discrete"):   # 절반 넘게 같은 값인 열은 엔진이 Z를 쓰지 않아(기준 규칙만 적용) 실험할 수 없음
+        return ([{"종류": kind, "크기": size, "반복": r, "해당 없음": True, "사유": "절반 넘게 같은 값이라 엔진이 Z를 안 씀"}
+                 for kind in kinds for size in sizes_of[kind] for r in range(reps)], base, {"척도": scale, "σ": sigma})
     for ki, kind in enumerate(kinds):
         for si, size in enumerate(sizes_of[kind]):
-            if kind == "낮은 쪽 극단값" and nonneg and med - size * sigma < 0:
-                recs += [{"종류": kind, "크기": size, "반복": r, "해당 없음": True} for r in range(reps)]
+            if kind == "낮은 쪽 극단값" and nonneg and inv(med - size * sigma) < 0:
+                recs += [{"종류": kind, "크기": size, "반복": r, "해당 없음": True, "사유": "음수가 돼서 해당 없음"} for r in range(reps)]
                 continue
             for rep in range(reps):
                 rng = np.random.default_rng(10000 * ki + 100 * si + rep)
@@ -314,9 +485,9 @@ def table_trials(sample, target, k, kinds, sizes_of, reps):
                 i = int(rng.choice(rows))
                 new = y.copy()
                 if kind == "높은 쪽 극단값":
-                    new[i] = med + size * sigma
+                    new[i] = inv(med + size * sigma)
                 elif kind == "낮은 쪽 극단값":
-                    new[i] = med - size * sigma
+                    new[i] = inv(med - size * sigma)
                 else:
                     f = {"×10": 10, "×100": 100, "÷10": 0.1, "÷100": 0.01}[size]
                     new[i] = y[i] * f
@@ -325,7 +496,7 @@ def table_trials(sample, target, k, kinds, sizes_of, reps):
                 flags = _table_flags(df, k)
                 recs.append({"종류": kind, "크기": size, "반복": rep, "행": i, "원래 값": float(y[i]), "바꾼 값": float(new[i]),
                              "잡음": i in flags, "오탐": len(flags - base - {i}), "해당 없음": False})
-    return recs, base, sigma
+    return recs, base, {"척도": scale, "σ": sigma}
 
 
 @st.cache_resource(max_entries=4, show_spinner=False)
@@ -334,12 +505,12 @@ def run_trials(data, mode, k, columns, name, target):
     t0 = time.time()
     if out["mode"] == "timeseries":
         start, win = ts_window(out)
-        recs, base_ev, sigma = ts_trials(win, target, k, TS_KINDS, TS_SIZES, REPS)
-        info = {"창 시작 행": start, "창 길이": len(win), "원래 이벤트": len(base_ev), "σ": sigma}
+        recs, base_ev, sigma, solo = ts_trials_auto(win, target, k, TS_KINDS, TS_SIZES, REPS)
+        info = {"창 시작 행": start, "창 길이": len(win), "원래 이벤트": len(base_ev), "σ": sigma, "대상 열만": solo}
         return {"mode": "timeseries", "recs": recs, "win": win, "base": base_ev, "info": info, "seconds": round(time.time() - t0, 1)}
     sample = table_sample(out)
-    recs, base, sigma = table_trials(sample, target, k, TABLE_KINDS, TABLE_SIZES, REPS)
-    info = {"표본 행": len(sample), "원래 이상치": len(base), "σ": sigma}
+    recs, base, sc_info = table_trials(sample, target, k, TABLE_KINDS, TABLE_SIZES, REPS)
+    info = {"표본 행": len(sample), "원래 이상치": len(base), "σ": sc_info["σ"], "척도": sc_info["척도"]}
     return {"mode": "table", "recs": recs, "win": sample, "base": base, "info": info, "seconds": round(time.time() - t0, 1)}
 
 
@@ -362,8 +533,9 @@ def trial_grid(recs):
             cell = [r for r in recs if r["종류"] == kind and r["크기"] == size]
             done = [r for r in cell if not r.get("해당 없음")]
             if not done:
+                why = next((r.get("사유") for r in cell if r.get("사유")), "해당 없음")
                 rows.append({"이상 종류": kind, "크기": f"{size}σ" if isinstance(size, (int, float)) else size,
-                             "재현율(%)": None, "실험 수": 0, "평균 오탐": None, "평균 지연(행)": None, "비고": "음수가 돼서 해당 없음"})
+                             "재현율(%)": None, "실험 수": 0, "평균 오탐": None, "평균 지연(행)": None, "비고": why})
                 continue
             delays = [r["지연"] for r in done if r.get("지연") is not None]
             rows.append({"이상 종류": kind, "크기": f"{size}σ" if isinstance(size, (int, float)) else size,
@@ -381,17 +553,18 @@ def run_k_sweep(data, mode, k, columns, name, target):
     pts = []
     if out["mode"] == "timeseries":
         _, win = ts_window(out)
+        solo = run_trials(data, mode, k, columns, name, target)["info"]["대상 열만"]   # 이상 심기 탭과 같은 방식으로
         for kk in K_GRID:
-            recs, base_ev, _ = ts_trials(win, target, kk, TS_KINDS, [4], 5)
+            recs, base_ev, _, _ = ts_trials_auto(win, target, kk, TS_KINDS, [4], 5, solo=solo)
             sc = trial_scores(recs)
-            pts.append({"k": kk, "재현율": sc["재현율"], "정밀도": sc["정밀도"], "F1": sc["F1"], "원래 데이터 표시 수": len(base_ev)})
+            pts.append({"k": kk, "재현율": sc["재현율"], "정밀도": sc["정밀도"], "F1": sc["F1"], "원래 데이터 표시 수": len(base_ev), "실험 수": sc["실험_수"]})
     else:
         sample = table_sample(out)
         sizes = {"높은 쪽 극단값": [4], "자릿수 실수": ["×10"]}
         for kk in K_GRID:
             recs, base, _ = table_trials(sample, target, kk, list(sizes), sizes, 10)
             sc = trial_scores(recs)
-            pts.append({"k": kk, "재현율": sc["재현율"], "정밀도": sc["정밀도"], "F1": sc["F1"], "원래 데이터 표시 수": len(base)})
+            pts.append({"k": kk, "재현율": sc["재현율"], "정밀도": sc["정밀도"], "F1": sc["F1"], "원래 데이터 표시 수": len(base), "실험 수": sc["실험_수"]})
     best = max(pts, key=lambda p: (p["F1"], -abs(p["k"] - 1.0)))
     return pts, best
 
@@ -452,6 +625,15 @@ def robust_check(out):
 
 # ================================================================ 2-5. 숫자 검증기 (내 파일의 기본 리포트로)
 NUM_RE = re.compile(r"(?<![\w.])(\d+\.\d+|\d{2,})(?![\w.])")
+# 날짜·시각(2026-01-01 00:01:40, 2026.01.01, 00:05) 안의 숫자 조각은 '계산값'이 아니라서 바꿔치기 시험에서 뺌.
+# 넣으면 '2026', '01'을 바꾼 경우까지 세서 시계열 리포트의 점수가 크게 낮아짐(예: 8/40)
+DATETIME_RE = re.compile(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?|\b\d{1,2}:\d{2}(?::\d{2})?\b")
+
+
+def _value_numbers(text):
+    """리포트에서 시험할 숫자들: 날짜·시각 안의 숫자는 뺌"""
+    spans = [m.span() for m in DATETIME_RE.finditer(text)]
+    return [m for m in NUM_RE.finditer(text) if not any(a <= m.start(1) < b for a, b in spans)]
 
 
 def verifier_check(out):
@@ -459,7 +641,7 @@ def verifier_check(out):
     s_text = json.dumps(out["summary"], ensure_ascii=False)
     clean = verify_numbers(base, s_text)
     cases = []
-    for m in list(NUM_RE.finditer(base))[:40]:
+    for m in _value_numbers(base)[:40]:
         v = float(m.group(1))
         wrong = round(v * 1.37 + 1, 2)
         tampered = base[:m.start(1)] + str(wrong) + base[m.end(1):]
@@ -480,28 +662,51 @@ def fitness_summary(res, diag, trials, kpts, kbest, rz_rows, ver, k):
             fpgrid.setdefault(row["이상 종류"], {})[row["크기"]] = row["평균 오탐"]
     compared = [r for r in rz_rows if r["일치"] in ("일치", "다름")]
     caught = sum(c["잡음"] for c in ver["cases"])
+    skipped = [r for r in trials["recs"] if r.get("해당 없음")]
+    why_skipped = list(dict.fromkeys(r.get("사유", "해당 없음") for r in skipped))
     return {
         "파일": {"행": out["profile"]["n"], "열": len(res["table"]["columns"]), "모드": "시계열" if out["mode"] == "timeseries" else "표",
                "분석_열": out["columns"], "실행_초": res["seconds"]},
         "데이터_진단": [{"항목": d["항목"], "상태": d["상태"], "내용": d["내용"], "권장": d["권장"]} for d in diag],
         "이상_심기": {"대상_열": trials["target"], "실험_수": sc["실험_수"], "재현율_퍼센트": round(100 * sc["재현율"], 1),
                   "큰_이상_재현율_퍼센트": round(100 * sc["큰_이상_재현율"], 1), "정밀도_퍼센트": round(100 * sc["정밀도"], 1),
-                  "종류별_크기별_재현율_퍼센트": grid, "종류별_크기별_평균_새_오탐": fpgrid},
+                  "종류별_크기별_재현율_퍼센트": grid, "종류별_크기별_평균_새_오탐": fpgrid,
+                  "척도": trials["info"].get("척도", "원래"), "못_한_실험_수": len(skipped), "못_한_이유": why_skipped,
+                  "대상_열만_실험": bool(trials["info"].get("대상 열만"))},
         "기준값_k": {"지금_k": k, "F1이_가장_높은_k": kbest["k"], "그때_F1": kbest["F1"],
-                  "k별": [{"k": p["k"], "재현율": p["재현율"], "정밀도": p["정밀도"], "원래_데이터_표시_수": p["원래 데이터 표시 수"]} for p in kpts]},
+                  "k별": [{"k": p["k"], "재현율": p["재현율"], "정밀도": p["정밀도"], "F1": p["F1"], "원래_데이터_표시_수": p["원래 데이터 표시 수"],
+                          "실험_수": p.get("실험 수")} for p in kpts]},
         "robust_Z_대조": {"비교한_열": len(compared), "일치한_열": sum(r["일치"] == "일치" for r in compared)},
         "숫자_검증기": {"바꾼_숫자": len(ver["cases"]), "잡은_수": caught, "깨끗한_리포트에서_틀렸다고_한_숫자": len(ver["clean"]["bad"])},
     }
 
 
+def grade_reasons(S):
+    """판정을 내린 이유(진단 항목 말고, 실험·대조에서 나온 것)를 사람 말로"""
+    T, rz = S["이상_심기"], S["robust_Z_대조"]
+    bad, warn = [], []
+    rz_bad = rz["비교한_열"] - rz["일치한_열"]
+    if rz_bad:
+        bad.append(f"robust Z 손 계산과 엔진 값이 {rz_bad}개 열에서 달라요.")
+    if T["실험_수"] == 0:
+        warn.append("이상 심기 실험을 할 자리가 없어서 엔진이 이 파일에서 이상을 잘 잡는지 확인하지 못했어요"
+                    + (f"({', '.join(T['못_한_이유'])})." if T["못_한_이유"] else "."))
+    elif T["큰_이상_재현율_퍼센트"] < 50:
+        bad.append(f"크기가 큰 심은 이상도 {T['큰_이상_재현율_퍼센트']}%만 잡았어요.")
+    elif T["큰_이상_재현율_퍼센트"] < 80:
+        warn.append(f"크기가 큰 심은 이상을 {T['큰_이상_재현율_퍼센트']}% 잡았어요(80% 미만).")
+    if T["실험_수"] and T["정밀도_퍼센트"] < 70:
+        warn.append(f"정밀도가 {T['정밀도_퍼센트']}%로 낮아요.")
+    return bad, warn
+
+
 def grade_of(S):
     probs = [d for d in S["데이터_진단"] if d["상태"] == "문제"]
     warns = [d for d in S["데이터_진단"] if d["상태"] == "주의"]
-    big = S["이상_심기"]["큰_이상_재현율_퍼센트"]
-    rz_bad = S["robust_Z_대조"]["비교한_열"] - S["robust_Z_대조"]["일치한_열"]
-    if probs or big < 50 or rz_bad:
+    bad, warn = grade_reasons(S)
+    if probs or bad:
         return "맞지 않음", probs, warns
-    if warns or big < 80 or S["이상_심기"]["정밀도_퍼센트"] < 70:
+    if warns or warn:
         return "주의 필요", probs, warns
     return "잘 맞음", probs, warns
 
@@ -519,7 +724,11 @@ def verdict_text(S):
              f"- {F['행']:,}행 · {F['모드']} 모드 · 분석 열 {len(F['분석_열'])}개({', '.join(F['분석_열'])})", ""]
     lines += ["## 잘 되는 것"]
     good = [d for d in S["데이터_진단"] if d["상태"] == "좋음"]
-    lines += [f"- 크기가 큰(4σ 이상·자릿수 실수) 심은 이상을 {T['큰_이상_재현율_퍼센트']}% 잡았어요. 전체 {T['실험_수']}회 중 재현율 {T['재현율_퍼센트']}%, 정밀도 {T['정밀도_퍼센트']}%예요."]
+    scale_note = " 엔진처럼 로그 척도에서 심었어요." if T.get("척도") == "로그" else ""
+    if T.get("대상_열만_실험"):
+        scale_note += f" 다른 열의 원래 이벤트가 파일을 덮고 있어 {T['대상_열']} 열 하나만으로 실험했어요."
+    if T["실험_수"]:
+        lines += [f"- 크기가 큰(4σ 이상·자릿수 실수) 심은 이상을 {T['큰_이상_재현율_퍼센트']}% 잡았어요. 전체 {T['실험_수']}회 중 재현율 {T['재현율_퍼센트']}%, 정밀도 {T['정밀도_퍼센트']}%예요.{scale_note}"]
     best = [(kind, size, v) for kind, d in T["종류별_크기별_재현율_퍼센트"].items() for size, v in d.items()]
     strong = [f"{kind} {size}" for kind, size, v in best if v >= 90]
     weak = [f"{kind} {size}({v}%)" for kind, size, v in best if v < 50 and (size.endswith("σ") and float(size[:-1]) >= 4)]
@@ -527,22 +736,31 @@ def verdict_text(S):
         lines.append("- 거의 다 잡는 경우: " + ", ".join(strong[:6]))
     rz = S["robust_Z_대조"]
     lines.append(f"- robust Z를 손으로 다시 계산해 보니 {rz['비교한_열']}개 열 중 {rz['일치한_열']}개가 엔진과 일치했어요.")
-    lines += [f"- {d['항목']}: {d['내용']}" for d in good if d["항목"] in ("모드와 데이터 모양", "이름표 같은 숫자 열", "기준 구간")]
+    lines += [f"- {d['항목']}: {d['내용']}" for d in good if d["항목"] in ("모드와 데이터 모양", "이름표 같은 숫자 열", "기준 구간", "측정 간격")]
     noisy = [f"{kind} {size}(평균 {v}개)" for kind, d in T["종류별_크기별_평균_새_오탐"].items() for size, v in d.items() if v and v >= 1]
     lines += ["", "## 주의할 것"]
-    if not probs and not warns and not weak and not noisy:
+    r_bad, r_warn = grade_reasons(S)
+    if not probs and not warns and not weak and not noisy and not r_bad and not r_warn:
         lines.append("- 특별히 주의할 점이 보이지 않았어요.")
     lines += [f"- **{d['항목']}** ({d['상태']}): {d['내용']}" for d in probs + warns]
+    lines += [f"- **점검 실험**: {x}" for x in r_bad + r_warn]
     if weak:
         lines.append("- 크기가 커도 잘 못 잡는 경우: " + ", ".join(weak))
     if noisy:
         lines.append("- 이런 값이 하나 들어가면 다른 정상 행까지 새로 표시돼요: " + ", ".join(noisy[:6])
                      + ". 값 하나 때문에 열 전체의 판정 기준(척도)이 바뀐 경우예요.")
     lines += ["", "## 권장 설정"]
-    if K["F1이_가장_높은_k"] != K["지금_k"]:
-        lines.append(f"- 이 파일에서는 k = {K['F1이_가장_높은_k']}일 때 F1이 가장 높았어요(F1 {K['그때_F1']}, 지금 k = {K['지금_k']}).")
+    now_f1 = next((p["F1"] for p in K["k별"] if p["k"] == K["지금_k"]), None)
+    if not any(p.get("실험_수") for p in K["k별"]):
+        lines.append("- 심어 볼 자리가 없어서 k별 비교를 하지 못했어요. 지금 k를 그대로 두고, 이벤트 목록을 현장 기록과 맞춰 보세요.")
+    elif K["F1이_가장_높은_k"] != K["지금_k"] and (now_f1 is None or K["그때_F1"] > now_f1 + 0.05):
+        lines.append(f"- 이 파일에서는 k = {K['F1이_가장_높은_k']}일 때 F1이 가장 높았어요(F1 {K['그때_F1']}, 지금 k = {K['지금_k']}의 F1 {now_f1}).")
+        cnt = {p["k"]: p["원래_데이터_표시_수"] for p in K["k별"]}
+        if cnt.get(K["F1이_가장_높은_k"], 0) > cnt.get(K["지금_k"], 0):
+            lines.append(f"- 다만 k = {K['F1이_가장_높은_k']}에서는 실험 구간의 원래 데이터에서 표시되는 수가 "
+                         f"{cnt.get(K['지금_k'])} → {cnt.get(K['F1이_가장_높은_k'])}개로 늘어요. 놓치지 않는 것과 조용한 것 중 무엇이 중요한지에 따라 고르세요.")
     else:
-        lines.append(f"- 지금 k = {K['지금_k']}일 때 이 파일에서 F1이 가장 높았어요(F1 {K['그때_F1']}).")
+        lines.append(f"- 지금 k = {K['지금_k']}가 적당해요(이 파일에서 F1 {now_f1 if now_f1 is not None else K['그때_F1']}, 가장 높은 값과 같거나 거의 같음).")
     advice = [d for d in S["데이터_진단"] if d["상태"] != "좋음" and d.get("권장")]
     lines += [f"- {d['권장']}" for d in advice]
     lines += ["", "## 한계",
@@ -574,7 +792,17 @@ def date_aggregate(data: bytes):
     return outdf.round(4).to_csv(index=False).encode("utf-8"), used, len(outdf)
 
 
-def suggest_fixes(diag, out, kbest, k, cols_now, agg_on):
+def _quieter_k(kpts, k):
+    """'많이 잡혀요'일 때 올려도 되는 k: 심은 이상을 놓치지 않는(F1이 지금보다 0.01 넘게 떨어지지 않는) 가장 큰 k.
+    없으면 None. 예전에는 k 탭 결과와 상관없이 다음 k를 추천해서, F1 1.0 → 0.57로 나빠지는 k를 권하기도 했음"""
+    now = next((p for p in kpts if p["k"] == k), None)
+    if not now or not now.get("실험 수"):
+        return None, now
+    ok = [p for p in kpts if p["k"] > k and p.get("실험 수") and p["F1"] >= now["F1"] - 0.01]
+    return (max(ok, key=lambda p: p["k"]) if ok else None), now
+
+
+def suggest_fixes(diag, out, kbest, k, cols_now, agg_on, kpts=None):
     """진단 결과마다 고칠 방법을 붙여요.
     설정: 버튼 하나로 바꿔 다시 점검 · 데이터 바꾸기: 페이지가 데이터를 새로 만들어 보여 줌(질문이 바뀜) · 데이터 준비: 사용자가 해야 함"""
     bad = {d["_key"]: d for d in diag if d["상태"] != "좋음"}
@@ -593,39 +821,60 @@ def suggest_fixes(diag, out, kbest, k, cols_now, agg_on):
                       "이유": "시계열 모드는 완전히 같은 행을 빼요. 서로 다른 사람·건이라면 표 모드로 봐야 해요."})
         combo["mode"] = "table"
     drop = []
-    if "code_cols" in bad:
-        drop += bad["code_cols"].get("_cols", [])
-    if "missing" in bad:
-        drop += bad["missing"].get("_cols", [])
+    for key_ in ("code_cols", "setting_cols", "missing"):
+        if key_ in bad:
+            drop += bad[key_].get("_cols", [])
     drop = list(dict.fromkeys(drop))
     keep = [c for c in cur_cols if c not in drop]
     if drop and keep:
-        fixes.append({"종류": "설정", "제목": f"{', '.join(drop)} 빼고 다시 점검", "apply": {"cols": keep}, "짧게": f"{', '.join(drop)} 빼기",
-                      "이유": "코드·번호처럼 숫자 크기에 뜻이 없거나 빈칸이 많은 열은 엔진 판정을 흐려요."})
+        show = ", ".join(drop[:6]) + (f" 외 {len(drop) - 6}개" if len(drop) > 6 else "")
+        fixes.append({"종류": "설정", "제목": f"{show} 빼고 다시 점검", "apply": {"cols": keep}, "짧게": f"{show} 빼기",
+                      "이유": "코드·번호·조사 가중치·설정 단계처럼 숫자 크기에 뜻이 없거나, 빈칸이 많은 열은 엔진 판정을 흐려요."})
         combo["cols"] = keep
     elif drop:
         fixes.append({"종류": "데이터 준비", "제목": "분석할 숫자 열이 있는 파일 준비",
                       "이유": f"문제 있는 열({', '.join(drop)})을 빼면 남는 숫자 열이 없어요. 값의 크기에 뜻이 있는 숫자 열이 필요해요."})
+    if "cap" in bad:
+        extra = [c for c in bad["cap"].get("_cols", []) if c not in drop and c not in cur_cols]
+        if extra:
+            cols_new = [c for c in cur_cols if c not in drop] + extra
+            show = ", ".join(extra[:6]) + (f" 외 {len(extra) - 6}개" if len(extra) > 6 else "")
+            fixes.append({"종류": "설정", "제목": f"빠진 숫자 열({show})까지 넣어 다시 점검", "apply": {"cols": cols_new},
+                          "짧게": "빠진 숫자 열 넣기",
+                          "이유": "자동 선택 상한 때문에 보지 않은 숫자 열이에요. 넣은 뒤 진단에서 코드·설정 열로 나오면 다시 빼세요. 열이 많으면 점검이 느려져요."})
+            combo["cols"] = cols_new
     if "flags" in bad:
-        bigger = kbest["k"] if kbest["k"] > k else next((x for x in K_GRID if x > k), None)
-        if bigger:
-            fixes.append({"종류": "설정", "제목": f"k = {bigger}로 다시 점검", "apply": {"k": bigger}, "짧게": f"k {bigger}",
-                          "이유": f"정상 데이터에서도 많이 잡혀요. k를 키우면 덜 민감해져요(지금 k = {k})."})
-            combo["k"] = bigger
+        if kpts is None:   # k별 결과가 없으면 예전 방식
+            bigger = kbest["k"] if kbest["k"] > k else next((x for x in K_GRID if x > k), None)
+            pick, now = ({"k": bigger} if bigger else None), None
+        else:
+            pick, now = _quieter_k(kpts, k)
+        if pick:
+            fixes.append({"종류": "설정", "제목": f"k = {pick['k']}로 다시 점검", "apply": {"k": pick["k"]}, "짧게": f"k {pick['k']}",
+                          "이유": f"정상 데이터에서도 많이 잡혀요. k를 키우면 덜 민감해져요(지금 k = {k})."
+                                  + (f" 이 파일에서 k = {pick['k']}도 심은 이상을 지금만큼 잡았어요(F1 {pick['F1']})." if "F1" in pick else "")})
+            combo["k"] = pick["k"]
+        elif kpts is not None:
+            nxt = next((p for p in kpts if p["k"] > k and p.get("실험 수")), None)
+            why = (f"k = {nxt['k']}로 키우면 심은 이상의 F1이 {now['F1']} → {nxt['F1']}로 떨어져요. " if nxt and now else
+                   "이 파일에서는 k를 바꿔 가며 심어 볼 자리가 없었어요. ")
+            fixes.append({"종류": "참고", "제목": "k는 그대로 두세요",
+                          "이유": why + "많이 잡히는 원인은 민감도보다 데이터 쪽(진단의 다른 주의 항목, 실제로 바뀐 구간)에 있을 가능성이 커요."})
     if "baseline" in bad:
-        fixes.append({"종류": "데이터 준비", "제목": "정상 구간이 앞에 오도록 파일 자르기",
-                      "이유": "엔진은 앞쪽 30%를 정상 기준으로 삼아요. 고장·시운전 구간이 앞에 있으면 그 뒤가 전부 이상해 보여요."})
+        fixes.append({"종류": "데이터 준비", "제목": "앞부분이 정상이 아니라면: 정상 구간이 앞에 오도록 파일 자르기",
+                      "이유": "엔진은 앞쪽 30%를 정상 기준으로 삼아요. 시운전·고장 구간이 앞에 있으면 그 뒤가 전부 이상해 보여요. "
+                              "앞부분이 정상이고 뒤에서 바뀐 거라면 자르지 말고, 그 변화(이벤트)를 열화·고장 전조로 읽으세요."})
     if "rows" in bad:
         fixes.append({"종류": "데이터 준비", "제목": "행을 더 모으기", "이유": "행이 적으면 판정이 흔들려요. 수백 행 이상을 권해요."})
     if "missing" in bad and bad["missing"]["상태"] == "문제" and not keep:
         fixes.append({"종류": "데이터 준비", "제목": "빈칸을 채운 파일 준비", "이유": bad["missing"]["내용"]})
     if "mode" in combo and "k" in combo:
         combo.pop("k")   # 추천 k는 지금 모드에서 잰 값이라, 모드를 바꿀 때는 같이 묶지 않음
-    parts = [f for f in fixes if f["종류"] == "설정" and set(f["apply"]) <= set(combo)]
+    parts = [f for f in fixes if f["종류"] == "설정" and f.get("apply") and set(f["apply"]) <= set(combo)]
     if len(parts) >= 2:
         fixes.insert(0, {"종류": "설정", "제목": "추천 설정 모두 적용해서 다시 점검", "apply": dict(combo),
                          "이유": " + ".join(f["짧게"] for f in parts)
-                                 + (" (k는 모드를 바꾼 뒤 다시 점검해서 정하세요)" if any("k" in f["apply"] for f in fixes) and "mode" in combo else "")})
+                                 + (" (k는 모드를 바꾼 뒤 다시 점검해서 정하세요)" if any("k" in f.get("apply", {}) for f in fixes) and "mode" in combo else "")})
     return fixes
 
 
@@ -746,7 +995,7 @@ def fake_writer(base_report, summary):
     def write(messages):
         if len(messages) > 1:
             return base_report
-        for m in NUM_RE.finditer(base_report):
+        for m in _value_numbers(base_report):
             for factor in (1.1, 1.37, 2.9, 7.3):
                 wrong = round(float(m.group(1)) * factor + 1, 2)
                 candidate = base_report[:m.start(1)] + str(wrong) + base_report[m.end(1):]
@@ -862,12 +1111,13 @@ except ValueError as e:
     st.error(str(e))
     st.stop()
 out = res["out"]
-diag = diagnose(res, mode)
+diag = diagnose(res, mode, cols_pick)
 
 if st.session_state.get("target") not in out["columns"]:
-    st.session_state.pop("target", None)
+    st.session_state["target"] = default_target(out)   # 설정·코드 열이 아닌 연속 측정값을 기본으로
 target = st.selectbox("이상 심기 실험에 쓸 열", out["columns"], key="target",
-                      help="이 열의 실제 값 위에 이상을 하나씩 심고 엔진이 잡는지 최대 240번 봐요(음수가 되는 실험은 빼요).")
+                      help="이 열의 실제 값 위에 이상을 하나씩 심고 엔진이 잡는지 최대 240번 봐요. "
+                           "음수가 되는 실험, 원래 이벤트와 겹치는 자리밖에 없는 실험은 빼요. 기본값은 설정·코드 열이 아닌 첫 측정값 열이에요.")
 with st.spinner("이상을 240번 심어 보고, 기준값 k를 바꿔 보는 중이에요… (큰 파일이면 30초쯤)"):
     trials = run_trials(data, mode, k, cols_key, fname, target)
     trials = dict(trials, target=target)
@@ -886,14 +1136,15 @@ history = record_history(orig_hash, setting_desc, grade, sc["큰_이상_재현�
 a, b, c, d = st.columns(4)
 a.metric("종합 판정", grade)
 b.metric("실제로 돈 모드", "시계열" if out["mode"] == "timeseries" else "표", f"분석 열 {len(out['columns'])}개", delta_color="off")
-c.metric("큰 이상 재현율", f"{sc['큰_이상_재현율']:.0%}", f"{sc['실험_수']}회 전체 {sc['재현율']:.0%}", delta_color="off",
+c.metric("큰 이상 재현율", f"{sc['큰_이상_재현율']:.0%}" if sc["실험_수"] else "실험 못 함",
+         f"{sc['실험_수']}회 전체 {sc['재현율']:.0%}" if sc["실험_수"] else "심어 볼 자리가 없었어요", delta_color="off",
          help="4σ 이상(표 모드는 자릿수 실수 포함)으로 심은 이상 중 엔진이 잡은 비율")
 d.metric("진단 경고", f"{sum(x['상태'] != '좋음' for x in diag)}개", f"항목 {len(diag)}개 중", delta_color="off")
 
 # ---------------------------------------------------------------- 2. 탭별 점검
 st.header("② 점검 결과")
 t_run, t_diag, t_inject, t_k, t_rob, t_ver = st.tabs(
-    ["기본 실행 결과", "데이터 진단", "이상 심기 240회", "기준값 k", "robust Z 대조", "숫자 검증기"])
+    ["기본 실행 결과", "데이터 진단", f"이상 심기 {sc['실험_수']}회", "기준값 k", "robust Z 대조", "숫자 검증기"])
 
 with t_run:
     st.caption(f"{out['notice']} · 분석 열: {', '.join(out['columns'])} · {res['seconds']}초")
@@ -922,9 +1173,18 @@ with t_inject:
     inf = trials["info"]
     if trials["mode"] == "timeseries":
         st.caption(f"실험 창: 정렬된 데이터의 {inf['창 시작 행']:,}번째부터 {inf['창 길이']}행(원래 이벤트가 가장 적은 구간) · "
-                   f"σ = 이 구간의 1.4826×MAD = {inf['σ']:.4g} · 창 안에 원래 있던 이벤트 {inf['원래 이벤트']}건은 오탐에서 빼요 · {trials['seconds']}초")
+                   f"σ = 이 구간의 1.4826×MAD = {inf['σ']:.4g} · 원래 이벤트 {inf['원래 이벤트']}건과 {EDGE_MARGIN}행 넘게 떨어진 자리에만 심고, "
+                   f"심은 자리 근처나 뒤에서 시작한 이벤트만 '잡음'으로 쳐요 · {trials['seconds']}초")
+        if inf.get("대상 열만"):
+            st.info(f"다른 열의 원래 이벤트가 창 대부분을 덮고 있어서, '{target}' 열 하나만 넣고 엔진을 돌려 실험했어요. "
+                    f"원래 이벤트 {inf['원래 이벤트']}건은 이 열만 봤을 때의 이벤트예요.")
     else:
-        st.caption(f"표본 {inf['표본 행']:,}행 · σ = 1.4826×MAD = {inf['σ']:.4g} · 원래 표시되던 행 {inf['원래 이상치']}개는 오탐에서 빼요 · {trials['seconds']}초")
+        scale_txt = "로그 척도(엔진과 같게)" if inf.get("척도") == "로그" else "원래 값"
+        st.caption(f"표본 {inf['표본 행']:,}행 · {scale_txt}에서 σ = 1.4826×MAD = {inf['σ']:.4g} · 원래 표시되던 행 {inf['원래 이상치']}개는 오탐에서 빼요 · {trials['seconds']}초")
+    if sc["실험_수"] == 0:
+        reasons = list(dict.fromkeys(r.get("사유", "해당 없음") for r in trials["recs"]))
+        st.info(f"이 열에서는 이상을 심어 볼 수 없었어요({', '.join(reasons)}). 원래 이벤트가 파일 대부분을 덮고 있으면 이렇게 돼요. "
+                "점수는 판정에서 빼고, 다른 열을 고르거나 정상 구간이 더 긴 파일로 시험하세요.")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("재현율", f"{sc['재현율']:.0%}", help="심은 이상 중 잡은 비율")
     m2.metric("큰 이상 재현율", f"{sc['큰_이상_재현율']:.0%}")
@@ -938,7 +1198,10 @@ with t_inject:
         ex1, ex2 = st.columns(2)
         ex_kind = ex1.selectbox("이상 종류", kinds)
         ex_size = ex2.selectbox("크기(σ)", TS_SIZES, index=1)
-        rec = next(r for r in trials["recs"] if r["종류"] == ex_kind and r["크기"] == ex_size and r["반복"] == 0)
+        rec = next((r for r in trials["recs"] if r["종류"] == ex_kind and r["크기"] == ex_size and r.get("y") is not None), None)
+    if trials["mode"] == "timeseries" and rec is None:
+        st.caption("이 종류·크기는 심어 볼 자리가 없어서 예시가 없어요.")
+    elif trials["mode"] == "timeseries":
         fig = go.Figure(go.Scatter(y=rec["y"], name=target, line=dict(color=BLUE, width=1.5),
                                    hovertemplate="창 안 %{x}행<br>%{y:.4g}<extra></extra>"))
         fig.add_vrect(x0=rec["시작"] - 0.5, x1=rec["시작"] + rec["길이"] - 0.5, fillcolor=GRAY, opacity=0.35, line_width=0)
@@ -948,7 +1211,8 @@ with t_inject:
         st.plotly_chart(fig, width="stretch")
         st.caption(f"회색 = 심은 구간(정답), 주황 = 엔진이 잡은 이벤트 · 이 예시: {'잡음' if rec['잡음'] else '놓침'}, 새 오탐 {rec['오탐']}건")
     else:
-        st.caption("표 모드는 한 행의 값만 바꿔서 그 행이 '확인이 필요한 행'에 들어가는지 봐요. 낮은 쪽 값이 음수가 되는 칸은 실험하지 않아요.")
+        st.caption("표 모드는 한 행의 값만 바꿔서 그 행이 '확인이 필요한 행'에 들어가는지 봐요. 극단값은 엔진이 그 열을 보는 척도"
+                   "(한쪽으로 늘어진 0 이상 열은 로그)에서 만들어요. 낮은 쪽 값이 음수가 되는 칸은 실험하지 않아요.")
 
 with t_k:
     st.subheader("기준값 k를 바꾸면 이 파일에서 어떻게 달라지나")
@@ -1043,15 +1307,23 @@ else:
         st.markdown(base_verdict)
 
 # ---------------------------------------------------------------- 3-1. 이렇게 바꿔 보세요
-fixes = suggest_fixes(diag, out, kbest, k, cols_pick, agg_on)
+fixes = suggest_fixes(diag, out, kbest, k, cols_pick, agg_on, kpts)
 st.subheader("이렇게 바꿔 보세요")
-if not fixes:
+if not fixes and grade == "잘 맞음":
     st.success("진단에서 고칠 점이 나오지 않았어요. 지금 설정 그대로 써도 돼요.")
+elif not fixes:
+    # 판정은 나쁜데 진단에는 고칠 점이 없는 경우: '그대로 써도 돼요'라고 하면 위 판정과 모순이라, 판정 이유를 그대로 보여 줌
+    r_bad, r_warn = grade_reasons(S)
+    d_items = [f"{d['항목']}: {d['내용']}" for d in diag if d["상태"] != "좋음"]
+    st.warning(f"판정이 '{grade}'인데, 설정 버튼으로 바로 고칠 수 있는 항목은 없어요. 판정 이유는 아래와 같아요. "
+               "실험 쪽 이유(크게 틀린 값도 놓침 등)는 엔진 방식의 한계라 설정을 바꿔도 크게 달라지지 않을 수 있어요.  \n"
+               + "  \n".join(f"- {x}" for x in d_items + r_bad + r_warn))
 else:
     if grade == "잘 맞음":
         st.caption("판정은 좋지만, 진단에서 손볼 만한 점이 있어요.")
     st.caption("원래 판정은 아래 '점검 기록'에 남아요. 버튼을 누르면 위의 설정이 바뀌고 같은 파일로 처음부터 다시 점검해요.")
-    kind_icon = {"설정": "🔧 설정만 바꾸면 돼요", "데이터 바꾸기": "🔄 페이지가 데이터를 바꿔서 보여 줘요", "데이터 준비": "📁 파일을 손봐서 다시 올려야 해요"}
+    kind_icon = {"설정": "🔧 설정만 바꾸면 돼요", "데이터 바꾸기": "🔄 페이지가 데이터를 바꿔서 보여 줘요", "데이터 준비": "📁 파일을 손봐서 다시 올려야 해요",
+                 "참고": "ℹ️ 참고"}
     for i, f in enumerate(fixes):
         with st.container(border=True):
             l, r = st.columns([4, 1])
